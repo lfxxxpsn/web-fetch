@@ -1,0 +1,100 @@
+name: Web page fetch test
+
+on:
+  workflow_dispatch:
+    inputs:
+      live_probe:
+        description: "Fetch one page after 60 seconds and back up to Releases (false = offline checks)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: web-page-fetch-test
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      capture_dir: ${{ steps.capture.outputs.capture_dir }}
+      artifact_id: ${{ steps.results.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Install development tools
+        run: python -m pip install -r requirements-dev.txt
+      - name: Lint
+        run: python -m ruff check .
+      - name: Check formatting
+        run: python -m ruff format --check .
+      - name: Typecheck
+        run: python -m mypy fetch_page.py archive_capture.py
+      - name: Offline tests
+        run: python -m unittest discover -s tests -v
+      - name: Check Python compilation
+        run: python -m compileall -q fetch_page.py archive_capture.py tests
+      - name: Test one live page
+        id: capture
+        if: ${{ inputs.live_probe }}
+        env:
+          TARGET_URL: ${{ secrets.TARGET_URL }}
+        run: python fetch_page.py --github-output "$GITHUB_OUTPUT"
+      - name: Package the successful capture
+        if: ${{ inputs.live_probe }}
+        env:
+          CAPTURE_DIR: ${{ steps.capture.outputs.capture_dir }}
+        run: python archive_capture.py "$CAPTURE_DIR"
+      - name: Upload probe results even when the site refuses access
+        id: results
+        if: ${{ always() && inputs.live_probe }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: web-page-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 14
+
+  backup:
+    needs: test
+    if: ${{ inputs.live_probe }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          artifact-ids: ${{ needs.test.outputs.artifact_id }}
+          path: artifacts/
+      - name: Verify and publish the backup
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          CAPTURE_DIR: ${{ needs.test.outputs.capture_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$CAPTURE_DIR"
+          sha256sum --check snapshot.zip.sha256
+          test "$(stat --format=%s snapshot.zip)" -lt 2147483648
+          tag="capture-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          cat > "$RUNNER_TEMP/release-notes.md" <<EOF
+          Successful page capture: ${CAPTURE_DIR##*/}
+
+          Assets: snapshot.zip and its SHA-256 checksum.
+          The ZIP contains page.html, tables.json, report.json and manifest.json.
+          Workflow: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+          EOF
+          gh release create "$tag" snapshot.zip snapshot.zip.sha256 \
+            --target "$GITHUB_SHA" \
+            --title "Page capture ${GITHUB_RUN_ID} (attempt ${GITHUB_RUN_ATTEMPT})" \
+            --notes-file "$RUNNER_TEMP/release-notes.md" --draft --latest=false
+          gh release edit "$tag" --draft=false --latest=false
