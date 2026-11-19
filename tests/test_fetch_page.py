@@ -75,7 +75,7 @@ class ConfigurationTests(unittest.TestCase):
             patch.object(probe, "capture", return_value=(True, Path("artifacts/test"))) as capture,
         ):
             self.assertEqual(probe.main(), 0)
-        capture.assert_called_once_with(TEST_URL, Path("artifacts"), 60)
+        capture.assert_called_once_with(TEST_URL, Path("artifacts"), 1)
         self.assertNotIn(TEST_URL, stdout.getvalue())
         self.assertNotIn("test-secret", stdout.getvalue())
 
@@ -198,10 +198,12 @@ class CaptureTests(unittest.TestCase):
         self.fetch.side_effect = lambda url: events.append(("get", url)) or response()
         ok, directory = probe.capture(TEST_URL, self.output)
         self.assertTrue(ok)
-        self.assertEqual(events, [("wait", 60), ("get", TEST_URL)])
+        self.assertEqual(events, [("wait", 1), ("get", TEST_URL)])
         self.assertEqual((directory / "page.html").read_bytes(), HTML.encode("utf-8"))
-        tables = json.loads((directory / "tables.json").read_text(encoding="utf-8"))
-        self.assertEqual(tables[0]["rows"][1][0]["text"], "テストホース & 馬")
+        self.assertEqual({file.name for file in directory.iterdir()}, {"page.html", "report.json"})
+        report = json.loads((directory / "report.json").read_text(encoding="utf-8"))
+        self.assertTrue(report["success"])
+        self.assertEqual(report["table_count"], 1)
 
     def test_http_errors_stop_without_retry_or_false_archive(self):
         for status in (301, 302, 403, 429, 500):
@@ -261,9 +263,9 @@ class CaptureTests(unittest.TestCase):
         self.fetch.assert_not_called()
         self.sleep.assert_not_called()
 
-    def test_cannot_reduce_delay_below_60_seconds(self):
+    def test_cannot_reduce_delay_below_one_second(self):
         with self.assertRaises(ValueError):
-            probe.capture(TEST_URL, self.output, delay=59)
+            probe.capture(TEST_URL, self.output, delay=0)
         self.fetch.assert_not_called()
         self.sleep.assert_not_called()
 

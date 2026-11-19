@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       live_probe:
-        description: "Fetch one page after 60 seconds and back up to Releases (false = offline checks)"
+        description: "Fetch one page after a 1-second wait and back up to Releases (false = offline checks)"
         type: boolean
         default: false
 
@@ -90,7 +90,7 @@ jobs:
           Successful page capture: ${CAPTURE_DIR##*/}
 
           Assets: snapshot.zip and its SHA-256 checksum.
-          The ZIP contains page.html, tables.json, report.json and manifest.json.
+          The ZIP contains the complete page.html, plus report.json and manifest.json.
           Workflow: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
           EOF
           gh release create "$tag" snapshot.zip snapshot.zip.sha256 \

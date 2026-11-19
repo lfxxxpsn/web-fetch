@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
-SOURCE_FILES = ("page.html", "tables.json", "report.json")
+SOURCE_FILES = ("page.html", "report.json")
 MAX_ASSET_BYTES = 2 * 1024**3  # GitHub requires each Release asset to be strictly under 2 GiB.
 
 
@@ -25,9 +25,6 @@ def create_archive(directory: Path) -> tuple[Path, Path]:
         or report.get("sha256") != hashlib.sha256(html).hexdigest()
     ):
         raise ValueError("HTML does not match the successful capture report.")
-    tables = json.loads(payloads["tables.json"])
-    if not isinstance(tables, list) or not tables or report.get("table_count") != len(tables):
-        raise ValueError("Table data does not match the capture report.")
 
     manifest = {
         "format_version": 1,

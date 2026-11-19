@@ -26,7 +26,6 @@ class ArchiveTests(unittest.TestCase):
             "table_count": 1,
         }
         (self.directory / "page.html").write_bytes(html)
-        (self.directory / "tables.json").write_text('[{"rows": []}]', encoding="utf-8")
         self.write_report()
 
     def write_report(self):
@@ -43,14 +42,13 @@ class ArchiveTests(unittest.TestCase):
         self.assertEqual(checksum.read_bytes(), f"{digest}  snapshot.zip\n".encode())
         with ZipFile(archive) as bundle:
             self.assertIsNone(bundle.testzip())
-            self.assertEqual(
-                set(bundle.namelist()), {"page.html", "tables.json", "report.json", "manifest.json"}
-            )
+            self.assertEqual(set(bundle.namelist()), {"page.html", "report.json", "manifest.json"})
             restored = self.directory / "restored"
             bundle.extractall(restored)
         manifest = json.loads((restored / "manifest.json").read_bytes())
         self.assertEqual(manifest["format_version"], 1)
-        for name in ("page.html", "tables.json", "report.json"):
+        self.assertEqual(set(manifest["files"]), {"page.html", "report.json"})
+        for name in ("page.html", "report.json"):
             original = (self.directory / name).read_bytes()
             self.assertEqual((restored / name).read_bytes(), original)
             self.assertEqual(manifest["files"][name]["bytes"], len(original))
@@ -83,18 +81,19 @@ class ArchiveTests(unittest.TestCase):
                 self.report[field] = original
 
     def test_missing_source_file_cannot_produce_partial_backup(self):
-        (self.directory / "tables.json").unlink()
+        (self.directory / "page.html").unlink()
         with self.assertRaises(OSError):
             backup.create_archive(self.directory)
         self.assert_no_archive()
 
-    def test_invalid_json_and_table_counts_are_rejected(self):
-        for content in ("not json", "{}", "[]", "[{}, {}]"):
-            with self.subTest(content=content):
-                (self.directory / "tables.json").write_text(content, encoding="utf-8")
-                with self.assertRaises(ValueError):
-                    backup.create_archive(self.directory)
-                self.assert_no_archive()
+    def test_older_capture_tables_are_left_out_of_the_archive(self):
+        tables = self.directory / "tables.json"
+        old_data = b'[{"rows": []}]'
+        tables.write_bytes(old_data)
+        archive, _ = backup.create_archive(self.directory)
+        with ZipFile(archive) as bundle:
+            self.assertNotIn("tables.json", bundle.namelist())
+        self.assertEqual(tables.read_bytes(), old_data)
 
     def test_existing_backup_is_never_overwritten(self):
         archive, checksum = backup.create_archive(self.directory)

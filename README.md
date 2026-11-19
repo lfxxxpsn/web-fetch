@@ -1,6 +1,6 @@
 # web-fetch
 
-本儲存庫專責取得與保存目標網站網頁：處理低頻率 HTTP 請求、回應驗證、原始 HTML 保存與抓取診斷。目前保留既有表格 JSON 作為抓取結果的輔助輸出；後續資料清洗、資料庫、分析或其他應用應放在各自的儲存庫。
+本儲存庫專責取得與保存目標網站網頁：處理低頻率 HTTP 請求、回應驗證、原始 HTML 保存與抓取診斷。網頁內容只保存完整 HTML，後續表格提取、資料清洗、資料庫與分析可在各自的儲存庫處理。
 
 此目錄是獨立的 Git 儲存庫，與其他專案分別存放於同一父目錄。
 
@@ -10,7 +10,7 @@
 
 ## 請求行為
 
-- 每次實際抓取先等待 60 秒，且只發出一次 GET。
+- 每次實際抓取先等待 1 秒，且只發出一次 GET。
 - 不自動重試、不跟隨重新導向、不執行 JavaScript，也不下載圖片、CSS 或其他資源。
 - Workflow 使用固定 concurrency group，避免這個儲存庫的測試工作重疊。
 - 403、429、其他非 200 回應或缺少賽事表格時，以失敗狀態結束；429 的 Retry-After 會記入報告，本次不重試。
@@ -47,7 +47,7 @@ Secret 只注入實際抓取的步驟；離線檢查不需要 Secret。未設定
 此工作區尚未連接 GitHub 遠端，因此目前已完成程式與 workflow 的 Secret 讀取設定，尚未在 GitHub 建立實際 Secret。設定方式參閱 [GitHub 官方說明](https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/use-secrets)。
 
 - `live_probe=false`（預設）：僅執行 lint、format、型別、離線測試與編譯檢查。
-- `live_probe=true`：上述檢查通過後，等待 60 秒並實際請求一頁，成功後打包並發布至 Releases。
+- `live_probe=true`：上述檢查通過後，等待 1 秒並實際請求一頁，成功後打包並發布至 Releases。
 
 成功或被網站拒絕時，都可在該次執行的 Artifacts 下載診斷結果，保留 14 天。若前置檢查失敗，尚未執行抓取，便不會產生抓取報告。
 
@@ -55,10 +55,10 @@ Secret 只注入實際抓取的步驟；離線檢查不需要 Secret。未設定
 
 每次成功抓取建立一個獨立 Release，tag 為 `capture-<run_id>-<run_attempt>`。重新執行整個 workflow 會使用新的 attempt，不覆蓋舊備份；每個 Release 只有兩個自行上傳的附件：
 
-- `snapshot.zip`：原始 `page.html`、`tables.json`、`report.json`，以及逐檔大小與 SHA-256 的 `manifest.json`。
+- `snapshot.zip`：完整 `page.html`、診斷 `report.json`，以及逐檔大小與 SHA-256 的 `manifest.json`。
 - `snapshot.zip.sha256`：整個 ZIP 的 SHA-256，可在下載後確認完整性。
 
-打包前檢查成功狀態、HTML 大小與雜湊、表格 JSON 及表格數量；僅打包這次指定目錄的三個來源檔，不會掃描其他歷史抓取或 `.env`。每個附件必須小於 2 GiB，超限會中止，不自動分卷。
+打包前檢查成功狀態、HTML 大小與雜湊。只從指定目錄讀取 `page.html` 與 `report.json`，所以有 `tables.json` 的舊抓取目錄也可用相同方式打包。每個附件必須小於 2 GiB，超限會中止，不自動分卷。
 
 抓取 job 只有 `contents: read`。獨立備份 job 取得 Artifact 後再次核對 ZIP 雜湊及大小，使用內建 `GITHUB_TOKEN` 與 `contents: write` 建立 Release，不需要額外 PAT Secret。先建立草稿並上傳附件，完成後才發布；不標成 Latest。tag 指向該次 workflow 的程式 commit，不把下載內容提交進 Git。
 
@@ -99,7 +99,7 @@ try {
 }
 ```
 
-請勿同時從多個本機程序或不同儲存庫執行。腳本不實作跨程序／跨儲存庫鎖；GitHub concurrency 只涵蓋本儲存庫的 workflow。需要更長等待時可傳入 `--delay-seconds 180`，無法低於 60 秒。
+請勿同時從多個本機程序或不同儲存庫執行。腳本不實作跨程序／跨儲存庫鎖；GitHub concurrency 只涵蓋本儲存庫的 workflow。需要更長等待時可傳入 `--delay-seconds 180`，無法低於 1 秒。
 
 ## 產出
 
@@ -107,7 +107,7 @@ try {
 
 - `report.json`：成功／失敗、時間、HTTP 狀態、傳輸與解壓後大小、壓縮方式、請求設定版本與 HTML SHA-256；網路失敗可能沒有 HTTP 狀態。新報告不記錄目標網址或重新導向網址，網路錯誤採固定訊息。
 - `page.html`：僅在狀態碼、HTML 類型與賽事表格標記通過驗證後保存 HTML 位元組；若 HTTP 回應有壓縮，先解壓再保存，不修改 HTML 內容。
-- `tables.json`：同份 HTML 中的表格文字；保留各儲存格的 `rowspan`／`colspan`，尚未整理為固定欄位的賽事資料集。
+報告保留表格數量供診斷。完整 HTML 可供離線重新解析表格，新抓取結果不再產生 `tables.json`。
 
 驗證要求可見內容含「出走馬」，且至少一張表格有兩列以上並含「馬名」「オッズ」。這只能排除常見錯誤／驗證頁，無法保證所有欄位完整或站方未改版。只有 script 內含這些字串不會被視為成功。
 
@@ -131,7 +131,7 @@ Actions 使用官方 [checkout](https://github.com/actions/checkout)、[setup-py
 
 程式只從環境變數讀取目標，沒有預設網址或 `--url` 參數；本機 `.env` 類檔案已加入 Git 忽略規則，但程式不會自動載入這些檔案。
 
-原始 HTML／表格仍可能含來源連結；GitHub Secret 不會自動清除下載內容。既有本機抓取結果保持原樣，舊診斷報告也可能包含先前網址；`artifacts/` 已被 Git 忽略，不會隨一般提交納入儲存庫。
+原始 HTML 和舊版存檔的表格仍可能含來源連結；GitHub Secret 不會自動清除下載內容。既有本機抓取結果保持原樣，舊診斷報告也可能包含先前網址；`artifacts/` 已被 Git 忽略，不會隨一般提交納入儲存庫。
 
 ## 設定移轉驗證
 

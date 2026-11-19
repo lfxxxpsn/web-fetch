@@ -11,7 +11,7 @@ import os
 import re
 import time
 import zlib
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from email.message import Message
 from html.parser import HTMLParser
@@ -39,7 +39,7 @@ REQUEST_HEADERS = {
     "Sec-Fetch-Site": "none",
     "Sec-Fetch-User": "?1",
 }
-MIN_DELAY = 60
+MIN_DELAY = 1
 MAX_BYTES = 8 * 1024 * 1024
 
 
@@ -225,7 +225,7 @@ def extract_tables(response: Response) -> list[Table]:
 def capture(url: str, output_root: Path, delay: int = MIN_DELAY) -> tuple[bool, Path]:
     validate_url(url)
     if delay < MIN_DELAY:
-        raise ValueError(f"Delay must be at least {MIN_DELAY} seconds.")
+        raise ValueError(f"Delay in seconds must be at least {MIN_DELAY}.")
     run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid4().hex[:8]
     directory = output_root / run_id
     directory.mkdir(parents=True, exist_ok=False)
@@ -256,13 +256,9 @@ def capture(url: str, output_root: Path, delay: int = MIN_DELAY) -> tuple[bool, 
                 "sha256": hashlib.sha256(response.body).hexdigest(),
             }
         )
-        tables = extract_tables(response)
+        table_count = len(extract_tables(response))
         (directory / "page.html").write_bytes(response.body)
-        (directory / "tables.json").write_text(
-            json.dumps([asdict(table) for table in tables], ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        report["table_count"] = len(tables)
+        report["table_count"] = table_count
         report["success"] = success = True
     except URLError:
         report["error"] = "Network request failed; no retry performed."
