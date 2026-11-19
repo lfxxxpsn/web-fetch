@@ -162,3 +162,82 @@ class BatchTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "page failed SHA-256"):
             run_batch(ORIGIN, DAY, self.root / "resumed", 6, altered)
         self.assertEqual(self.events, [])
+
+    def test_full_day_lists_first_and_extends_the_pilot_without_refetching(self):
+        original = run_batch(ORIGIN, DAY, self.root / "pilot", 6, None)
+        self.assertEqual(original.state, "complete")
+        all_races = [f"/race_result/120260102{i:02}20261114" for i in range(1, 15)]
+        self.responses["/sitemap_race.gz"] = response(
+            "<urlset>"
+            + "".join(f"<url><loc>{ORIGIN + race}</loc></url>" for race in all_races)
+            + "</urlset>"
+        )
+        for race in all_races[3:]:
+            self.responses[race] = response(race_html(race))
+            self.responses[result_path(race)] = response(RESULT)
+
+        self.events.clear()
+        listed = run_batch(
+            ORIGIN,
+            DAY,
+            self.root / "list",
+            6,
+            self.root / "pilot/batch.zip",
+            full_day=True,
+            list_only=True,
+        )
+        self.assertEqual(listed.races, all_races)
+        self.assertEqual(listed.pages, original.pages)
+        self.assertEqual(listed.pending(), 22)
+        self.assertEqual(
+            [url for kind, url in self.events if kind == "get"],
+            ["/robots.txt", "/sitemap.gz", "/sitemap_race.gz"],
+        )
+
+        self.events.clear()
+        part = run_batch(
+            ORIGIN, DAY, self.root / "part", 6, self.root / "list/batch.zip", full_day=True
+        )
+        self.assertEqual(part.state, "paused")
+        self.assertEqual(len(part.pages), 26)
+        self.assertEqual(part.pending(), 2)
+        self.assertEqual(part.requests_this_run, 21)
+        self.assertFalse(set(original.pages) & {url for kind, url in self.events if kind == "get"})
+
+        self.events.clear()
+        complete = run_batch(
+            ORIGIN, DAY, self.root / "full", 6, self.root / "part/batch.zip", full_day=True
+        )
+        self.assertEqual(complete.state, "complete")
+        self.assertEqual(complete.pending(), 0)
+        self.assertEqual(len(complete.pages), 28)
+        self.assertEqual(
+            [url for kind, url in self.events if kind == "get"],
+            ["/robots.txt", all_races[-1], result_path(all_races[-1])],
+        )
+
+    def test_day_reconciles_missing_pages_and_saves_other_html(self):
+        self.responses[RACES[0]] = response("Not found", 404)
+        self.responses[RACES[1]] = response(race_html(RACES[1], "/unrelated"))
+        self.responses[result_path(RACES[2])] = response("Gone", 410)
+        state = run_batch(ORIGIN, DAY, self.root / "missing", 6, None, full_day=True)
+        self.assertEqual(state.state, "complete_with_missing")
+        self.assertEqual(state.pending(), 0)
+        self.assertEqual(set(state.pages), set(RACES[1:]))
+        self.assertEqual(
+            state.missing,
+            {
+                RACES[0]: "HTTP 404",
+                result_path(RACES[0]): "Race page unavailable",
+                result_path(RACES[1]): "No result link",
+                result_path(RACES[2]): "HTTP 410",
+            },
+        )
+        self.assertNotIn(("get", result_path(RACES[0])), self.events)
+        self.assertNotIn(("get", result_path(RACES[1])), self.events)
+        self.events.clear()
+        restored = run_batch(
+            ORIGIN, DAY, self.root / "restored", 6, self.root / "missing/batch.zip", full_day=True
+        )
+        self.assertEqual(restored.missing, state.missing)
+        self.assertEqual(self.events, [])

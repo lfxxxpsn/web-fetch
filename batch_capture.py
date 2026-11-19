@@ -1,4 +1,4 @@
-"""Capture three same-day races and their linked results, with verifiable checkpoints."""
+"""Capture same-day races and linked results in bounded, resumable batches."""
 
 from __future__ import annotations
 
@@ -33,8 +33,11 @@ from fetch_page import (
 )
 
 RACE_COUNT = 3
+DAY_BATCH_RACES = 10
+MAX_DAY_RACES = 100  # Keep a full checkpoint below the Release attachment limit.
 SITEMAP_MAX_BYTES = 50 * 1024**2
 RACE_PATH = re.compile(r"/race_result/[0-9]{9,32}")
+ABSENT_REASONS = {"HTTP 404", "HTTP 410", "No result link", "Race page unavailable"}
 
 
 @dataclass
@@ -54,6 +57,14 @@ class Checkpoint:
     error: str = ""
     retry_at: str | None = None
     requests_this_run: int = 0
+    full_day: bool = False
+    missing: dict[str, str] = field(default_factory=dict)
+
+    def addresses(self) -> set[str]:
+        return {*self.races, *(result_path(path) for path in self.races)}
+
+    def pending(self) -> int:
+        return len(self.addresses()) - len(self.pages) - len(self.missing)
 
 
 def sha256(payload: bytes) -> str:
@@ -92,6 +103,11 @@ class Blocked(ValueError):
             self.retry_at = max(until, now).isoformat()
 
 
+class Unavailable(ValueError):
+    def __init__(self, status: int) -> None:
+        super().__init__(f"HTTP {status}")
+
+
 class Site:
     def __init__(self, origin: str, checkpoint: Checkpoint) -> None:
         self.origin = origin
@@ -110,6 +126,8 @@ class Site:
         response = fetch_once(self.origin + path)
         if response.status in (403, 429):
             raise Blocked(response.status, response.headers.get("Retry-After"))
+        if response.status in (404, 410):
+            raise Unavailable(response.status)
         if response.status != 200:
             raise ValueError(f"HTTP {response.status}; stopped without retry or redirect.")
         return response
@@ -135,7 +153,7 @@ class Site:
             raise ValueError(f"Expected sitemap element {root}.")
         return [loc.text.strip() for loc in element.findall("./*/{*}loc") if loc.text]
 
-    def select_races(self, day: date) -> list[str]:
+    def select_races(self, day: date, *, full_day: bool = False) -> list[str]:
         index = next(
             (
                 path
@@ -158,6 +176,10 @@ class Site:
             and RACE_PATH.fullmatch(path)
             and path.endswith(day.strftime("%Y%m%d"))
         }
+        if full_day:
+            if not paths or len(paths) > MAX_DAY_RACES:
+                raise ValueError("The sitemap returned an empty or oversized race day.")
+            return sorted(paths)
         if len(paths) < RACE_COUNT:
             raise ValueError("The race sitemap has fewer than three races on the selected date.")
         return sorted(paths)[:RACE_COUNT]
@@ -206,18 +228,31 @@ def restore(directory: Path, archive: Path, day: date, origin: str) -> Checkpoin
         state = Checkpoint(**data)
         if state.day != day.isoformat() or state.site_hash != sha256(origin.encode()):
             raise ValueError("Checkpoint date or site does not match the requested batch.")
-        if state.races and (
-            len(state.races) != RACE_COUNT
-            or len(set(state.races)) != RACE_COUNT
+        if not isinstance(state.full_day, bool) or not isinstance(state.races, list):
+            raise ValueError("Checkpoint contains an invalid race selection.")
+        count = len(state.races)
+        if (
+            count
+            and not state.full_day
+            and count != RACE_COUNT
+            or count > MAX_DAY_RACES
+            or any(not isinstance(race, str) for race in state.races)
+            or len(set(state.races)) != count
             or any(
-                not RACE_PATH.fullmatch(r) or not r.endswith(day.strftime("%Y%m%d"))
-                for r in state.races
+                not RACE_PATH.fullmatch(race) or not race.endswith(day.strftime("%Y%m%d"))
+                for race in state.races
             )
         ):
             raise ValueError("Checkpoint contains an invalid race selection.")
-        allowed = {*state.races, *(result_path(path) for path in state.races)}
-        if not saved_pages.keys() <= allowed or any(
-            result_path(race) in saved_pages and race not in saved_pages for race in state.races
+        if (
+            not isinstance(saved_pages, dict)
+            or not isinstance(state.missing, dict)
+            or not (saved_pages.keys() | state.missing.keys()) <= state.addresses()
+            or saved_pages.keys() & state.missing.keys()
+            or any(reason not in ABSENT_REASONS for reason in state.missing.values())
+            or any(
+                result_path(race) in saved_pages and race not in saved_pages for race in state.races
+            )
         ):
             raise ValueError("Checkpoint contains unexpected pages.")
         for path, metadata in saved_pages.items():
@@ -241,35 +276,71 @@ def save_page(directory: Path, state: Checkpoint, path: str, response: Response)
     )
 
 
+def capture_race(
+    directory: Path, site: Site, state: Checkpoint, race: str, page_budget: int
+) -> None:
+    result = result_path(race)
+    if race not in state.pages:
+        try:
+            response = site.get(race)
+        except Unavailable as error:
+            if not state.full_day:
+                raise
+            state.missing[race] = str(error)
+            state.missing[result] = "Race page unavailable"
+            return
+        extract_tables(response)
+        save_page(directory, state, race, response)
+        if page_budget == 1:
+            return
+
+    headers = Message()
+    headers["content-type"] = state.pages[race].content_type
+    page = (directory / archive_name(race)).read_bytes()
+    parser = ResultLink(site.origin, race)
+    parser.feed(page.decode(headers.get_content_charset() or "utf-8"))
+    if not parser.found:
+        if not state.full_day:
+            raise ValueError("The selected race has no matching official result link.")
+        state.missing[result] = "No result link"
+        return
+    try:
+        response = site.get(result)
+    except Unavailable as error:
+        if not state.full_day:
+            raise
+        state.missing[result] = str(error)
+        return
+    official_result(response)
+    save_page(directory, state, result, response)
+
+
 def capture_missing(directory: Path, site: Site, state: Checkpoint, budget: int) -> None:
-    initial_count = len(state.pages)
+    saved_before = len(state.pages)
+    races_processed = 0
     for race in state.races:
         result = result_path(race)
-        if result in state.pages:
+        if result in state.pages or result in state.missing:
             continue
-        if race not in state.pages:
-            response = site.get(race)
-            extract_tables(response)
-            save_page(directory, state, race, response)
-            if len(state.pages) - initial_count >= budget:
-                return
-        headers = Message()
-        headers["content-type"] = state.pages[race].content_type
-        page = (directory / archive_name(race)).read_bytes()
-        parser = ResultLink(site.origin, race)
-        parser.feed(page.decode(headers.get_content_charset() or "utf-8"))
-        if not parser.found:
-            raise ValueError("The selected race has no matching official result link.")
-        response = site.get(result)
-        official_result(response)
-        save_page(directory, state, result, response)
-        if len(state.pages) - initial_count >= budget:
+        remaining = 2 if state.full_day else budget - (len(state.pages) - saved_before)
+        if remaining <= 0 or (state.full_day and races_processed >= DAY_BATCH_RACES):
             return
+        capture_race(directory, site, state, race, remaining)
+        races_processed += 1
 
 
 def run_batch(
-    origin: str, day: date, directory: Path, budget: int, previous: Path | None
+    origin: str,
+    day: date,
+    directory: Path,
+    budget: int,
+    previous: Path | None,
+    *,
+    full_day: bool = False,
+    list_only: bool = False,
 ) -> Checkpoint:
+    if list_only and not full_day:
+        raise ValueError("List-only mode requires a full race day.")
     (directory / "pages").mkdir(parents=True, exist_ok=False)
     state = (
         restore(directory, previous, day, origin)
@@ -280,16 +351,27 @@ def run_batch(
         state.retry_at and datetime.fromisoformat(state.retry_at) > datetime.now(UTC)
     ):
         raise ValueError("The saved checkpoint is blocked by the site's access response.")
+    if state.full_day and not full_day:
+        raise ValueError("A full-day checkpoint requires full-day mode.")
     state.error = ""
     state.retry_at = None
     try:
-        if len(state.pages) < 2 * RACE_COUNT:
+        discover = not state.races or (full_day and not state.full_day)
+        if discover or (not list_only and state.pending()):
             site = Site(origin, state)
             site.read_robots()
-            if not state.races:
-                state.races = site.select_races(day)
-            capture_missing(directory, site, state, budget)
-        state.state = "complete" if len(state.pages) == 2 * RACE_COUNT else "paused"
+            if discover:
+                races = sorted(set(site.select_races(day, full_day=full_day)) | set(state.races))
+                if len(races) > MAX_DAY_RACES:
+                    raise ValueError("The combined race-day list exceeds the checkpoint limit.")
+                state.races = races
+                state.full_day = full_day
+            if not list_only:
+                capture_missing(directory, site, state, budget)
+        if state.pending():
+            state.state = "paused"
+        else:
+            state.state = "complete_with_missing" if state.missing else "complete"
     except Blocked as error:
         state.state = "forbidden" if error.status == 403 else "rate_limited"
         state.error = str(error)
@@ -319,6 +401,8 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--pause-after", type=int, choices=range(1, 7), default=6)
+    parser.add_argument("--full-day", action="store_true")
+    parser.add_argument("--list-only", action="store_true")
     args = parser.parse_args()
     try:
         target = urlsplit(load_target_url())
@@ -328,18 +412,21 @@ def main() -> int:
             args.output,
             args.pause_after,
             args.resume,
+            full_day=args.full_day,
+            list_only=args.list_only,
         )
     except ValueError, TypeError, OSError, KeyError, BadZipFile:
         parser.exit(1, "Could not initialize or verify the batch checkpoint.\n")
     print(
-        f"{state.state}: {len(state.pages)}/{2 * RACE_COUNT} pages; "
+        f"{state.state}: {len(state.races)} races, {len(state.pages)} HTML pages, "
+        f"{len(state.missing)} missing, {state.pending()} pending; "
         f"{state.requests_this_run} site requests."
     )
     if state.error:
         print(state.error)
     if state.retry_at:
         print(f"Retry no earlier than {state.retry_at}.")
-    return 0 if state.state in {"complete", "paused"} else 2
+    return 0 if state.state in {"complete", "complete_with_missing", "paused"} else 2
 
 
 if __name__ == "__main__":

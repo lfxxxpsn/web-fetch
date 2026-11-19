@@ -4,7 +4,7 @@
 
 此目錄是獨立的 Git 儲存庫，與其他專案分別存放於同一父目錄。
 
-提供 GitHub Actions 單頁測試與三場同日賽事的手動批次試跑，結果可保存至 GitHub Releases。
+提供 GitHub Actions 單頁測試、三場試跑與整個賽事日的手動分批備份，結果可保存至 GitHub Releases。
 
 目標網址僅從 `TARGET_URL` 環境變數讀取。GitHub Actions 使用同名 Repository Secret 注入；程式、workflow 與文件都不保存實際目標網址。
 
@@ -51,11 +51,15 @@ Secret 只注入實際抓取的步驟；離線檢查不需要 Secret。未設定
 
 成功或被網站拒絕時，都可在該次執行的 Artifacts 下載診斷結果，保留 14 天。若前置檢查失敗，尚未執行抓取，便不會產生抓取報告。
 
-## 三場賽事的批次試跑
+## 賽事批次備份
 
-在 **Actions → Race batch pilot → Run workflow** 輸入一個已結束的賽事日（`race_day`，格式 `YYYY-MM-DD`）。程式讀取站方 robots.txt、主 sitemap 和賽事子清單，從當日條目選出三場。每場保存賽事頁與頁內實際連結的正式賽果頁，共最多六份完整 HTML。單頁與批次共用 workflow 的 concurrency group，網站請求逐一執行，回應完成後至少間隔 1 秒。
+在 **Actions → Race batch pilot → Run workflow** 輸入一個已結束的賽事日（`race_day`，格式 `YYYY-MM-DD`）。程式讀取站方 robots.txt、主 sitemap 和賽事子清單。每場保存賽事頁與頁內實際連結的正式賽果頁。單頁與批次共用 workflow 的 concurrency group，網站請求逐一執行，回應完成後至少間隔 1 秒。
 
-驗證續跑時，首次將 `pause_after` 設為 `1`，保存一頁後發布 `pilot-<run_id>-<run_attempt>` Release。第二次用相同日期，將該 tag 填入 `resume_tag`，並把 `pause_after` 設為 `6`。新的 runner 下載並核對 ZIP 和逐頁雜湊，只請求缺少的 HTML。完成的 `batch.zip` 可獨立還原，`checkpoint.json` 記錄相對路徑、檔案雜湊、抓取狀態與本次網站請求數。各 HTML 檔名由相對路徑的 SHA-256 產生。
+- `mode=pilot` 選三場。測試續跑時先將 `pause_after` 設為 `1`，保存一頁後暫停。第二次用相同日期，填入前一次 Release tag，將 `pause_after` 設為 `6` 以補齊。
+- `mode=day-list` 列出當天所有 sitemap 賽事並固定清單。可在 `resume_tag` 指定同日的三場試跑 Release，驗證後沿用已保存的 HTML。此模式只發送盤點請求。
+- `mode=race-day` 以清單為準，每次處理最多十場尚未完成的賽事。下一次用同一天和最新的 `pilot-<run_id>-<run_attempt>` tag 續跑。若報告還有 pending，繼續執行下一批。
+
+每份 `batch.zip` 可獨立還原。新的 runner 下載並核對 ZIP 與逐頁雜湊，再跳過已保存的 HTML。各 HTML 檔名由相對路徑的 SHA-256 產生，`checkpoint.json` 記錄賽事清單、相對路徑、雜湊、缺頁原因與本次網站請求數。遇缺少正式結果連結、404 或 410 時，整日模式會列明原因並接著處理其他賽事。最終每個預期頁面都有 HTML 或缺頁原因，狀態會標成 `complete` 或 `complete_with_missing`。
 
 遇到 403 或 429 會停止該批次，能發布時先保留已保存的頁面和狀態，再將 Actions 標為失敗。403 的進度會拒絕續跑；429 會記下 Retry-After，缺少有效值時等一小時。續跑以已發布的進度為準，runner 若在 ZIP 上傳前被強制終止，該次尚未持久化的頁面需再抓一次。
 

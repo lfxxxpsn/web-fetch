@@ -7,8 +7,13 @@ on:
         description: "Completed race date (YYYY-MM-DD)"
         required: true
         type: string
+      mode:
+        description: "Keep the three-race pilot, list a full day, or capture up to ten races"
+        type: choice
+        default: "pilot"
+        options: ["pilot", "day-list", "race-day"]
       pause_after:
-        description: "Maximum new HTML pages in this run (use 1 to test resuming)"
+        description: "Pilot mode only: maximum new HTML pages"
         type: choice
         default: "6"
         options: ["1", "2", "3", "4", "5", "6"]
@@ -53,11 +58,18 @@ jobs:
         env:
           TARGET_URL: ${{ secrets.TARGET_URL }}
           RACE_DAY: ${{ inputs.race_day }}
+          MODE: ${{ inputs.mode }}
           PAUSE_AFTER: ${{ inputs.pause_after }}
           RESUME_TAG: ${{ inputs.resume_tag }}
         shell: bash
         run: |
           args=(--day "$RACE_DAY" --pause-after "$PAUSE_AFTER" --output pilot)
+          case "$MODE" in
+            pilot) ;;
+            day-list) args+=(--full-day --list-only) ;;
+            race-day) args+=(--full-day) ;;
+            *) exit 2 ;;
+          esac
           if [[ -n "$RESUME_TAG" ]]; then
             args+=(--resume previous/batch.zip)
           fi
@@ -104,7 +116,7 @@ jobs:
           Workflow: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
           EOF
           gh release create "$tag" batch.zip batch.zip.sha256 \
-            --target "$GITHUB_SHA" --title "Race batch pilot: ${GITHUB_RUN_ID}" \
+            --target "$GITHUB_SHA" --title "Race batch backup: ${GITHUB_RUN_ID}" \
             --notes-file "$notes" --draft --latest=false
           gh release edit "$tag" --draft=false --latest=false
           test "$PILOT_STATUS" = 0
