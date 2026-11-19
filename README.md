@@ -4,7 +4,7 @@
 
 此目錄是獨立的 Git 儲存庫，與其他專案分別存放於同一父目錄。
 
-目前提供 GitHub Actions 單頁存取測試，成功後自動保存至 GitHub Releases；尚未啟用定時或批次抓取。
+提供 GitHub Actions 單頁測試與三場同日賽事的手動批次試跑，結果可保存至 GitHub Releases。
 
 目標網址僅從 `TARGET_URL` 環境變數讀取。GitHub Actions 使用同名 Repository Secret 注入；程式、workflow 與文件都不保存實際目標網址。
 
@@ -26,9 +26,9 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
 .\.venv\Scripts\python.exe -m ruff check .
 .\.venv\Scripts\python.exe -m ruff format --check .
-.\.venv\Scripts\python.exe -m mypy fetch_page.py archive_capture.py
+.\.venv\Scripts\python.exe -m mypy fetch_page.py archive_capture.py batch_capture.py
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
-.\.venv\Scripts\python.exe -m compileall -q fetch_page.py archive_capture.py tests
+.\.venv\Scripts\python.exe -m compileall -q fetch_page.py archive_capture.py batch_capture.py tests
 ```
 
 單元測試使用假回應；重新導向測試只連線到本機 loopback HTTP server，不接觸目標網站。這是腳本專案，沒有另行打包的 build 步驟；compileall 檢查 Python 語法編譯。
@@ -50,6 +50,14 @@ Secret 只注入實際抓取的步驟；離線檢查不需要 Secret。未設定
 - `live_probe=true`：上述檢查通過後，等待 1 秒並實際請求一頁，成功後打包並發布至 Releases。
 
 成功或被網站拒絕時，都可在該次執行的 Artifacts 下載診斷結果，保留 14 天。若前置檢查失敗，尚未執行抓取，便不會產生抓取報告。
+
+## 三場賽事的批次試跑
+
+在 **Actions → Race batch pilot → Run workflow** 輸入一個已結束的賽事日（`race_day`，格式 `YYYY-MM-DD`）。程式讀取站方 robots.txt、主 sitemap 和賽事子清單，從當日條目選出三場。每場保存賽事頁與頁內實際連結的正式賽果頁，共最多六份完整 HTML。單頁與批次共用 workflow 的 concurrency group，網站請求逐一執行，回應完成後至少間隔 1 秒。
+
+驗證續跑時，首次將 `pause_after` 設為 `1`，保存一頁後發布 `pilot-<run_id>-<run_attempt>` Release。第二次用相同日期，將該 tag 填入 `resume_tag`，並把 `pause_after` 設為 `6`。新的 runner 下載並核對 ZIP 和逐頁雜湊，只請求缺少的 HTML。完成的 `batch.zip` 可獨立還原，`checkpoint.json` 記錄相對路徑、檔案雜湊、抓取狀態與本次網站請求數。各 HTML 檔名由相對路徑的 SHA-256 產生。
+
+遇到 403 或 429 會停止該批次，能發布時先保留已保存的頁面和狀態，再將 Actions 標為失敗。403 的進度會拒絕續跑；429 會記下 Retry-After，缺少有效值時等一小時。續跑以已發布的進度為準，runner 若在 ZIP 上傳前被強制終止，該次尚未持久化的頁面需再抓一次。
 
 ## GitHub Releases 長期備份
 

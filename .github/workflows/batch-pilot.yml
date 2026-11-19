@@ -1,0 +1,110 @@
+name: Race batch pilot
+
+on:
+  workflow_dispatch:
+    inputs:
+      race_day:
+        description: "Completed race date (YYYY-MM-DD)"
+        required: true
+        type: string
+      pause_after:
+        description: "Maximum new HTML pages in this run (use 1 to test resuming)"
+        type: choice
+        default: "6"
+        options: ["1", "2", "3", "4", "5", "6"]
+      resume_tag:
+        description: "Optional pilot Release tag from the previous run"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: web-page-fetch-test
+  cancel-in-progress: false
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      result: ${{ steps.batch.outputs.result }}
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Download the previous pilot checkpoint
+        if: ${{ inputs.resume_tag != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RESUME_TAG: ${{ inputs.resume_tag }}
+        shell: bash
+        run: |
+          [[ "$RESUME_TAG" =~ ^pilot-[0-9]+-[0-9]+$ ]]
+          gh release download "$RESUME_TAG" --pattern batch.zip --pattern batch.zip.sha256 --dir previous
+      - name: Save selected race pages and linked results
+        id: batch
+        env:
+          TARGET_URL: ${{ secrets.TARGET_URL }}
+          RACE_DAY: ${{ inputs.race_day }}
+          PAUSE_AFTER: ${{ inputs.pause_after }}
+          RESUME_TAG: ${{ inputs.resume_tag }}
+        shell: bash
+        run: |
+          args=(--day "$RACE_DAY" --pause-after "$PAUSE_AFTER" --output pilot)
+          if [[ -n "$RESUME_TAG" ]]; then
+            args+=(--resume previous/batch.zip)
+          fi
+          code=0
+          python batch_capture.py "${args[@]}" || code=$?
+          test -s pilot/batch.zip
+          test -s pilot/batch.zip.sha256
+          printf 'result=%s\n' "$code" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v7
+        id: upload
+        with:
+          name: race-pilot-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            pilot/batch.zip
+            pilot/batch.zip.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    needs: capture
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          artifact-ids: ${{ needs.capture.outputs.artifact_id }}
+          path: pilot
+      - name: Publish the checkpoint and report the batch result
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PILOT_STATUS: ${{ needs.capture.outputs.result }}
+        working-directory: pilot
+        shell: bash
+        run: |
+          sha256sum --check batch.zip.sha256
+          tag="pilot-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          notes="$RUNNER_TEMP/pilot-notes.md"
+          cat > "$notes" <<EOF
+          Race and official result HTML verified so far, plus the resumable checkpoint.
+
+          Workflow: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+          EOF
+          gh release create "$tag" batch.zip batch.zip.sha256 \
+            --target "$GITHUB_SHA" --title "Race batch pilot: ${GITHUB_RUN_ID}" \
+            --notes-file "$notes" --draft --latest=false
+          gh release edit "$tag" --draft=false --latest=false
+          test "$PILOT_STATUS" = 0

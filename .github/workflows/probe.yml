@@ -36,11 +36,11 @@ jobs:
       - name: Check formatting
         run: python -m ruff format --check .
       - name: Typecheck
-        run: python -m mypy fetch_page.py archive_capture.py
+        run: python -m mypy fetch_page.py archive_capture.py batch_capture.py
       - name: Offline tests
         run: python -m unittest discover -s tests -v
       - name: Check Python compilation
-        run: python -m compileall -q fetch_page.py archive_capture.py tests
+        run: python -m compileall -q fetch_page.py archive_capture.py batch_capture.py tests
       - name: Test one live page
         id: capture
         if: ${{ inputs.live_probe }}
