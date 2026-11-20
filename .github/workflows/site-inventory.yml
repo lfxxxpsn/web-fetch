@@ -1,0 +1,121 @@
+name: Site backup inventory
+
+on:
+  workflow_dispatch:
+    inputs:
+      race_tags:
+        description: "Optional comma-separated race backup Release tags to reconcile"
+        type: string
+        default: ""
+      previous_inventory:
+        description: "Optional inventory Release tag from a previous run"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: web-page-fetch-test
+  cancel-in-progress: false
+
+jobs:
+  inventory:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      result: ${{ steps.reconcile.outputs.result }}
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Download verified backup inputs
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RACE_TAGS: ${{ inputs.race_tags }}
+          PREVIOUS: ${{ inputs.previous_inventory }}
+        run: |
+          if [[ -n "$PREVIOUS" ]]; then
+            [[ "$PREVIOUS" =~ ^(inventory|site-batch)-[0-9]+-[0-9]+$ ]]
+            gh release download "$PREVIOUS" --pattern 'catalog.zip*' --dir previous-inventory
+          fi
+          IFS=',' read -r -a tags <<< "$RACE_TAGS"
+          for tag in "${tags[@]}"; do
+            [[ "$tag" =~ ^pilot-[0-9]+-[0-9]+$ ]]
+            gh release download "$tag" --pattern 'batch.zip*' --dir "race-inputs/$tag"
+          done
+      - name: Reconcile sitemaps and existing HTML
+        id: reconcile
+        shell: bash
+        env:
+          TARGET_URL: ${{ secrets.TARGET_URL }}
+        run: |
+          args=(--output inventory)
+          if [[ -f previous-inventory/catalog.zip ]]; then
+            args+=(--previous previous-inventory/catalog.zip)
+          fi
+          shopt -s nullglob
+          for archive in race-inputs/*/batch.zip; do
+            parent="${archive%/batch.zip}"
+            args+=(--race-backup "${parent##*/}=$archive")
+          done
+          code=0
+          python site_catalog.py "${args[@]}" || code=$?
+          test "$code" = 0 || test "$code" = 2
+          test -s inventory/catalog.zip
+          test -s inventory/catalog.zip.sha256
+          printf 'result=%s\n' "$code" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v7
+        id: upload
+        with:
+          name: site-inventory-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            inventory/catalog.zip
+            inventory/catalog.zip.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    needs: inventory
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          artifact-ids: ${{ needs.inventory.outputs.artifact_id }}
+          path: inventory
+      - name: Verify and publish the inventory
+        working-directory: inventory
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          INVENTORY_STATUS: ${{ needs.inventory.outputs.result }}
+        run: |
+          sha256sum --check catalog.zip.sha256
+          tag="inventory-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          notes="$RUNNER_TEMP/inventory-notes.md"
+          status="Sitemap reconciliation completed."
+          if [[ "$INVENTORY_STATUS" = 2 ]]; then
+            status="The source site stopped this inventory. This catalog preserves the previous inventory and records the hold."
+          fi
+          cat > "$notes" <<EOF
+          Site URL inventory, coverage summary, and index of archived HTML versions.
+
+          $status
+
+          Workflow: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+          EOF
+          gh release create "$tag" catalog.zip catalog.zip.sha256 \
+            --target "$GITHUB_SHA" --title "Site backup inventory: ${GITHUB_RUN_ID}" \
+            --notes-file "$notes" --draft --latest=false
+          gh release edit "$tag" --draft=false --latest=false
+          test "$INVENTORY_STATUS" = 0

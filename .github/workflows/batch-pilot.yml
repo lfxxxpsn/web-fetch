@@ -17,8 +17,12 @@ on:
         type: choice
         default: "6"
         options: ["1", "2", "3", "4", "5", "6"]
+      resume_run_id:
+        description: "Actions run ID of an intermediate checkpoint"
+        type: string
+        default: ""
       resume_tag:
-        description: "Optional pilot Release tag from the previous run"
+        description: "Release tag of a published checkpoint (instead of a run ID)"
         type: string
         default: ""
 
@@ -33,8 +37,12 @@ jobs:
   capture:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
     outputs:
       result: ${{ steps.batch.outputs.result }}
+      publish: ${{ steps.batch.outputs.publish }}
       artifact_id: ${{ steps.upload.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@v7
@@ -44,15 +52,35 @@ jobs:
         with:
           python-version: "3.14"
       - name: Download the previous pilot checkpoint
-        if: ${{ inputs.resume_tag != '' }}
+        if: ${{ inputs.resume_run_id != '' || inputs.resume_tag != '' }}
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          RESUME_RUN_ID: ${{ inputs.resume_run_id }}
           RESUME_TAG: ${{ inputs.resume_tag }}
         shell: bash
         run: |
-          [[ "$RESUME_TAG" =~ ^pilot-[0-9]+-[0-9]+$ ]]
-          gh release download "$RESUME_TAG" --pattern batch.zip --pattern batch.zip.sha256 --dir previous
+          if [[ -n "$RESUME_RUN_ID" && -n "$RESUME_TAG" ]]; then
+            echo '::error::Use either resume_run_id or resume_tag.'
+            exit 2
+          fi
+          if [[ -n "$RESUME_TAG" ]]; then
+            [[ "$RESUME_TAG" =~ ^pilot-[0-9]+-[0-9]+$ ]]
+            gh release download "$RESUME_TAG" \
+              --pattern batch.zip --pattern batch.zip.sha256 --dir previous
+          else
+            [[ "$RESUME_RUN_ID" =~ ^[0-9]+$ ]]
+            attempt=$(gh run view "$RESUME_RUN_ID" --json status,attempt \
+              --jq 'select(.status == "completed") | .attempt')
+            if [[ ! "$attempt" =~ ^[0-9]+$ ]]; then
+              echo '::error::The checkpoint run must be completed.'
+              exit 1
+            fi
+            artifact="race-pilot-$RESUME_RUN_ID-$attempt"
+            gh run download "$RESUME_RUN_ID" --name "$artifact" --dir previous
+          fi
+          test -s previous/batch.zip
+          test -s previous/batch.zip.sha256
       - name: Save selected race pages and linked results
         id: batch
         env:
@@ -60,7 +88,6 @@ jobs:
           RACE_DAY: ${{ inputs.race_day }}
           MODE: ${{ inputs.mode }}
           PAUSE_AFTER: ${{ inputs.pause_after }}
-          RESUME_TAG: ${{ inputs.resume_tag }}
         shell: bash
         run: |
           args=(--day "$RACE_DAY" --pause-after "$PAUSE_AFTER" --output pilot)
@@ -70,14 +97,21 @@ jobs:
             race-day) args+=(--full-day) ;;
             *) exit 2 ;;
           esac
-          if [[ -n "$RESUME_TAG" ]]; then
+          if [[ -f previous/batch.zip ]]; then
             args+=(--resume previous/batch.zip)
           fi
           code=0
           python batch_capture.py "${args[@]}" || code=$?
           test -s pilot/batch.zip
           test -s pilot/batch.zip.sha256
-          printf 'result=%s\n' "$code" >> "$GITHUB_OUTPUT"
+          state=$(python -c 'import json; print(json.load(open("pilot/checkpoint.json"))["state"])')
+          publish=false
+          case "$state" in
+            forbidden|rate_limited) publish=true ;;
+            complete|complete_with_missing)
+              if [[ "$MODE" == race-day ]]; then publish=true; fi ;;
+          esac
+          printf 'result=%s\npublish=%s\n' "$code" "$publish" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v7
         id: upload
         with:
@@ -87,9 +121,13 @@ jobs:
             pilot/batch.zip.sha256
           if-no-files-found: error
           retention-days: 14
+      - name: Report a failed capture after saving the checkpoint
+        if: ${{ steps.batch.outputs.result != '0' && steps.batch.outputs.publish != 'true' }}
+        run: exit 1
 
   publish:
     needs: capture
+    if: ${{ needs.capture.outputs.publish == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

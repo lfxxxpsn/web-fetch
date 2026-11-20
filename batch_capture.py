@@ -141,14 +141,17 @@ class Site:
         if isinstance(delay, int):
             self.delay = max(MIN_DELAY, delay)
 
-    def sitemap(self, path: str, root: str) -> list[str]:
+    def sitemap_document(self, path: str) -> ElementTree.Element:
         raw = self.get(path).body
         if raw.startswith(b"\x1f\x8b"):
             with gzip.GzipFile(fileobj=io.BytesIO(raw)) as stream:
                 raw = stream.read(SITEMAP_MAX_BYTES + 1)
         if len(raw) > SITEMAP_MAX_BYTES or "<!DOCTYPE" in raw.decode("utf-8").upper():
             raise ValueError("Unexpected sitemap size or XML structure.")
-        element = ElementTree.fromstring(raw)
+        return ElementTree.fromstring(raw)
+
+    def sitemap(self, path: str, root: str) -> list[str]:
+        element = self.sitemap_document(path)
         if element.tag.split("}")[-1] != root:
             raise ValueError(f"Expected sitemap element {root}.")
         return [loc.text.strip() for loc in element.findall("./*/{*}loc") if loc.text]

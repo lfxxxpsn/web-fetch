@@ -1,0 +1,128 @@
+name: Site HTML backup batch
+
+on:
+  workflow_dispatch:
+    inputs:
+      previous_catalog:
+        description: "Latest verified inventory or site-batch Release tag"
+        type: string
+        required: true
+      category:
+        description: "Page category to capture"
+        type: choice
+        default: "all"
+        options: ["all", "entry", "race", "result", "local_race", "horse", "jockey", "article", "analysis", "pedigree", "chart", "race_history"]
+      limit:
+        description: "Maximum HTML requests per run (1–100)"
+        type: number
+        default: 20
+      mode:
+        description: "Backfill new targets or recheck previously observed pages"
+        type: choice
+        default: "backfill"
+        options: ["backfill", "refresh"]
+      min_age_hours:
+        description: "Refresh mode only: minimum hours since the last check"
+        type: number
+        default: 24
+
+permissions:
+  contents: read
+
+concurrency:
+  group: web-page-fetch-test
+  cancel-in-progress: false
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    outputs:
+      result: ${{ steps.batch.outputs.result }}
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Download the preceding verified catalog
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PREVIOUS: ${{ inputs.previous_catalog }}
+        run: |
+          [[ "$PREVIOUS" =~ ^(inventory|site-batch)-[0-9]+-[0-9]+$ ]]
+          gh release download "$PREVIOUS" --pattern 'catalog.zip*' --dir previous
+      - name: Capture selected HTML
+        id: batch
+        shell: bash
+        env:
+          TARGET_URL: ${{ secrets.TARGET_URL }}
+          CATEGORY: ${{ inputs.category }}
+          LIMIT: ${{ inputs.limit }}
+          MODE: ${{ inputs.mode }}
+          MIN_AGE: ${{ inputs.min_age_hours }}
+        run: |
+          args=()
+          case "$MODE" in
+            backfill) ;;
+            refresh) args+=(--refresh-hours "$MIN_AGE") ;;
+            *) exit 2 ;;
+          esac
+          code=0
+          python site_capture.py --previous previous/catalog.zip --output backup \
+            --tag "site-batch-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --category "$CATEGORY" --limit "$LIMIT" "${args[@]}" || code=$?
+          for file in catalog.zip catalog.zip.sha256 pages.zip pages.zip.sha256; do
+            test -s "backup/$file"
+          done
+          printf 'result=%s\n' "$code" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v7
+        id: upload
+        with:
+          name: site-backup-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            backup/catalog.zip
+            backup/catalog.zip.sha256
+            backup/pages.zip
+            backup/pages.zip.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    needs: capture
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          artifact-ids: ${{ needs.capture.outputs.artifact_id }}
+          path: backup
+      - name: Verify and publish the page archives and updated catalog
+        shell: bash
+        working-directory: backup
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          BATCH_STATUS: ${{ needs.capture.outputs.result }}
+        run: |
+          sha256sum --check catalog.zip.sha256 pages.zip.sha256
+          unzip -qt catalog.zip
+          unzip -qt pages.zip
+          tag="site-batch-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          notes="$RUNNER_TEMP/site-backup-notes.md"
+          cat > "$notes" <<EOF
+          The catalog locates all backed-up versions. This pages ZIP contains only new HTML.
+
+          Workflow: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+          EOF
+          gh release create "$tag" catalog.zip catalog.zip.sha256 pages.zip pages.zip.sha256 \
+            --target "$GITHUB_SHA" --title "Site HTML backup: ${GITHUB_RUN_ID}" \
+            --notes-file "$notes" --draft --latest=false
+          gh release edit "$tag" --draft=false --latest=false
+          test "$BATCH_STATUS" = 0

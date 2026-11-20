@@ -10,7 +10,7 @@
 
 ## 請求行為
 
-- 每次實際抓取先等待 1 秒，且只發出一次 GET。
+- 每次網站請求前至少等待 10 秒，且只發出一次 GET。批次流程會依 robots.txt 採用更長的等待時間。
 - 不自動重試、不跟隨重新導向、不執行 JavaScript，也不下載圖片、CSS 或其他資源。
 - Workflow 使用固定 concurrency group，避免這個儲存庫的測試工作重疊。
 - 403、429、其他非 200 回應或缺少賽事表格時，以失敗狀態結束；429 的 Retry-After 會記入報告，本次不重試。
@@ -26,9 +26,9 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
 .\.venv\Scripts\python.exe -m ruff check .
 .\.venv\Scripts\python.exe -m ruff format --check .
-.\.venv\Scripts\python.exe -m mypy fetch_page.py archive_capture.py batch_capture.py
+.\.venv\Scripts\python.exe -m mypy fetch_page.py archive_capture.py batch_capture.py site_catalog.py site_capture.py site_restore.py
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
-.\.venv\Scripts\python.exe -m compileall -q fetch_page.py archive_capture.py batch_capture.py tests
+.\.venv\Scripts\python.exe -m compileall -q fetch_page.py archive_capture.py batch_capture.py site_catalog.py site_capture.py site_restore.py tests
 ```
 
 單元測試使用假回應；重新導向測試只連線到本機 loopback HTTP server，不接觸目標網站。這是腳本專案，沒有另行打包的 build 步驟；compileall 檢查 Python 語法編譯。
@@ -47,21 +47,57 @@ Secret 只注入實際抓取的步驟；離線檢查不需要 Secret。未設定
 此工作區尚未連接 GitHub 遠端，因此目前已完成程式與 workflow 的 Secret 讀取設定，尚未在 GitHub 建立實際 Secret。設定方式參閱 [GitHub 官方說明](https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/use-secrets)。
 
 - `live_probe=false`（預設）：僅執行 lint、format、型別、離線測試與編譯檢查。
-- `live_probe=true`：上述檢查通過後，等待 1 秒並實際請求一頁，成功後打包並發布至 Releases。
+- `live_probe=true`：上述檢查通過後，等待 10 秒並實際請求一頁，成功後打包並發布至 Releases。
 
 成功或被網站拒絕時，都可在該次執行的 Artifacts 下載診斷結果，保留 14 天。若前置檢查失敗，尚未執行抓取，便不會產生抓取報告。
 
 ## 賽事批次備份
 
-在 **Actions → Race batch pilot → Run workflow** 輸入一個已結束的賽事日（`race_day`，格式 `YYYY-MM-DD`）。程式讀取站方 robots.txt、主 sitemap 和賽事子清單。每場保存賽事頁與頁內實際連結的正式賽果頁。單頁與批次共用 workflow 的 concurrency group，網站請求逐一執行，回應完成後至少間隔 1 秒。
+在 **Actions → Race batch pilot → Run workflow** 輸入一個已結束的賽事日（`race_day`，格式 `YYYY-MM-DD`）。程式讀取站方 robots.txt、主 sitemap 和賽事子清單。每場保存賽事頁與頁內實際連結的正式賽果頁。單頁與批次共用 workflow 的 concurrency group，網站請求逐一執行，回應完成後至少間隔 10 秒。
 
-- `mode=pilot` 選三場。測試續跑時先將 `pause_after` 設為 `1`，保存一頁後暫停。第二次用相同日期，填入前一次 Release tag，將 `pause_after` 設為 `6` 以補齊。
-- `mode=day-list` 列出當天所有 sitemap 賽事並固定清單。可在 `resume_tag` 指定同日的三場試跑 Release，驗證後沿用已保存的 HTML。此模式只發送盤點請求。
-- `mode=race-day` 以清單為準，每次處理最多十場尚未完成的賽事。下一次用同一天和最新的 `pilot-<run_id>-<run_attempt>` tag 續跑。若報告還有 pending，繼續執行下一批。
+- `mode=pilot` 選三場。測試續跑時先將 `pause_after` 設為 `1`，保存一頁後暫停。第二次用相同日期，在 `resume_run_id` 填入前次 Actions 執行 ID，將 `pause_after` 設為 `6` 以補齊。
+- `mode=day-list` 列出當天所有 sitemap 賽事並固定清單。可沿用同日的三場試跑進度。此模式只發送盤點請求。
+- `mode=race-day` 以清單為準，每次處理最多十場尚未完成的賽事。若報告還有 pending，使用相同日期及最新進度接續下一批。
+
+賽事清單、試跑及中間批次存於 Actions Artifacts，保留 14 天。續跑時將前次已結束的執行網址 `/actions/runs/` 後的數字填入 `resume_run_id`，流程會讀取該次執行最新嘗試所產生的進度。若進度已發布成 Release，可改在 `resume_tag` 填入 `pilot-<run_id>-<run_attempt>`，兩欄擇一。指定的 Artifact 不存在或已過期時，流程會在向網站發出請求前停止。整日備份完成後才發布正式 Release。
 
 每份 `batch.zip` 可獨立還原。新的 runner 下載並核對 ZIP 與逐頁雜湊，再跳過已保存的 HTML。各 HTML 檔名由相對路徑的 SHA-256 產生，`checkpoint.json` 記錄賽事清單、相對路徑、雜湊、缺頁原因與本次網站請求數。遇缺少正式結果連結、404 或 410 時，整日模式會列明原因並接著處理其他賽事。最終每個預期頁面都有 HTML 或缺頁原因，狀態會標成 `complete` 或 `complete_with_missing`。
 
-遇到 403 或 429 會停止該批次，能發布時先保留已保存的頁面和狀態，再將 Actions 標為失敗。403 的進度會拒絕續跑；429 會記下 Retry-After，缺少有效值時等一小時。續跑以已發布的進度為準，runner 若在 ZIP 上傳前被強制終止，該次尚未持久化的頁面需再抓一次。
+遇到 403 或 429 會停止該批次，將已保存的頁面與暫停狀態發布至 Release，再將 Actions 標為失敗。403 的進度會拒絕續跑。429 會記下 Retry-After，缺少有效值時等一小時。其他抓取失敗會將可保存的進度留在 Artifacts。若 runner 在 ZIP 上傳前被強制終止，該次尚未持久化的頁面需再抓一次。
+
+## 全站備份清單
+
+使用 **Actions → Site backup inventory → Run workflow**，可讀取 robots.txt 及同站 sitemap 清單，產生並發布 `inventory-<run_id>-<run_attempt>`。這個 workflow 只向網站請求 robots.txt 和 sitemap，並與抓取工作共用執行群組。
+
+- `race_tags` 可填逗號分隔的賽事備份 tag。索引會驗證 ZIP 和逐頁 SHA-256，建立相對網址到 Release、ZIP 內檔案與雜湊的對照，並離線讀取其站內連結。
+- `previous_inventory` 可指定上一次的 inventory tag。重新盤點會更新清單、保留舊版本索引，並重新以當次 robots.txt 評估未保存的網址。網址從 sitemap 消失仍會留在索引。
+- `catalog.zip` 包含 `catalog.sqlite3` 與 `inventory.json`。摘要按頁型列出已保存、待抓、缺頁、待確認與明確排除的網址。從站內連結發現的地方賽事頁，以及帶單一 `race_id` 的賽事分析頁，會保留原始網址並納入清單。未分類的查詢參數和新頁型列入待確認。公開庫的索引會顯示來源路徑與查詢參數。
+
+盤點途中遇到 403 或 429 時，程式會停止並保存暫停紀錄，沿用上一份索引的完整資料。首次盤點若遇阻擋，Release 仍會保留站點及暫停資訊。Actions 會標為失敗，下次盤點或續跑請選這份 Release 作為起點。403 需先確認站方允許存取，429 須等到記錄的 `Retry-After` 時間。
+
+## 依全站清單分批備份
+
+從 **Actions → Site HTML backup batch** 手動執行。把最近一次已確認備份的索引或批次 Release tag 填入 `previous_catalog`，選擇頁型及每次請求的頁面上限。首次可各選少量馬匹、騎手或文章頁驗證。之後可用 `all` 從已分類範圍接續回補，預設每批 20 頁，可設 1–100。
+
+程式先核對索引 ZIP、SQLite 與站點身分，再按待抓清單逐一請求，跳過已備份和已記錄下架的網址。每次重新檢查 robots.txt。驗證後保存完整 HTML，並離線加入其中新發現的站內連結。若出現 403 或 429，先保存本次已取得頁面及暫停狀態。續跑使用最新索引，429 需等到 Retry-After；403 需先檢查站方的存取狀態。未知頁型與未分類的查詢參數會保留在待確認清單。
+
+每個 `site-batch-<run_id>-<run_attempt>` 有兩個 ZIP 及各自的 SHA-256 校驗檔。更新後的 `catalog.zip` 記錄全部已備份頁面的 Release tag、檔名與雜湊；`pages.zip` 只裝本次新增的 HTML 與其 `batch.json`，舊頁留在原 Release。下一批或再次盤點時可沿用最新 tag。
+
+### 重查變動及還原
+
+在同一個 workflow 選擇 `mode=refresh` 時，預設只選距上次檢查至少 24 小時的已保存或缺頁網址。程式優先重查 sitemap `lastmod` 晚於上次檢查、且盤點時已到達該時間的頁面，其餘依上次檢查時間由舊到新輪查。每頁仍會請求一次，再比較 HTML 的 SHA-256。相同內容沿用原檔，有變化才新增版本。頁面下架仍可還原最近有效版本。頁面恢復到已保存過的內容時，索引會記錄恢復的時間並沿用舊檔。
+
+以 `site_restore.py` 查詢某頁的版本。先下載索引 ZIP 與同名校驗檔。查詢結果會列出所需 Release tag 和備份 ZIP 檔名：
+
+```powershell
+python site_restore.py --catalog .\catalog.zip --path "/race_result/<比賽識別碼>"
+```
+
+下載查到的 ZIP 與同名校驗檔至 `releases/<tag>/`，再加上 `--releases .\releases --output .\restored.html`。若要還原指定版本，可加 `--sha256 <版本雜湊>`。程式會核對索引和備份 ZIP 的 SHA-256，再核對 HTML 的大小和雜湊。輸出檔已存在時會停止。
+
+### 整庫校驗
+
+將索引 ZIP 及其校驗檔下載到本機。把索引引用的 Release 備份 ZIP 及校驗檔放在 `releases/<tag>/`，再執行 `python site_restore.py --catalog catalog.zip --audit --releases releases`。它會逐一核對每份 Release 的 ZIP 及其中被索引的 HTML，並分別列出缺少的檔案、完整性錯誤和目前網址清單覆蓋率。檔案校驗通過後，仍可用覆蓋率中的待抓、待確認與缺頁數目核對回補進度。
 
 ## GitHub Releases 長期備份
 
@@ -111,7 +147,7 @@ try {
 }
 ```
 
-請勿同時從多個本機程序或不同儲存庫執行。腳本不實作跨程序／跨儲存庫鎖；GitHub concurrency 只涵蓋本儲存庫的 workflow。需要更長等待時可傳入 `--delay-seconds 180`，無法低於 1 秒。
+請勿同時從多個本機程序或不同儲存庫執行。腳本不實作跨程序／跨儲存庫鎖；GitHub concurrency 只涵蓋本儲存庫的 workflow。需要更長等待時可傳入 `--delay-seconds 180`，無法低於 10 秒。
 
 ## 產出
 

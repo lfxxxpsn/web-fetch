@@ -39,7 +39,7 @@ REQUEST_HEADERS = {
     "Sec-Fetch-Site": "none",
     "Sec-Fetch-User": "?1",
 }
-MIN_DELAY = 1
+MIN_DELAY = 10
 MAX_BYTES = 8 * 1024 * 1024
 
 

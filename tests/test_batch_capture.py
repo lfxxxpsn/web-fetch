@@ -88,7 +88,7 @@ class BatchTests(unittest.TestCase):
             [
                 event
                 for path in ("/robots.txt", "/sitemap.gz", "/sitemap_race.gz", RACES[0])
-                for event in (("wait", 1), ("get", path))
+                for event in (("wait", 10), ("get", path))
             ],
         )
         self.events.clear()
@@ -106,6 +106,17 @@ class BatchTests(unittest.TestCase):
             for race in RACES:
                 self.assertEqual(bundle.read(archive_name(race)), race_html(race))
                 self.assertEqual(bundle.read(archive_name(result_path(race))), RESULT.encode())
+
+    def test_robots_can_extend_the_minimum_request_interval(self):
+        self.responses["/robots.txt"] = response(
+            f"User-agent: *\nCrawl-delay: 25\nSitemap: {ORIGIN}/sitemap.gz\n",
+            content_type="text/plain",
+        )
+        state = run_batch(ORIGIN, DAY, self.root / "longer-delay", 1, None)
+        self.assertEqual(state.requests_this_run, 4)
+        self.assertEqual(
+            [value for action, value in self.events if action == "wait"], [10, 25, 25, 25]
+        )
 
     def test_missing_and_cross_site_result_links_are_not_requested(self):
         for href in ("/unrelated", "https://other.invalid" + result_path(RACES[0])):

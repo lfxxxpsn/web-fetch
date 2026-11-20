@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       live_probe:
-        description: "Fetch one page after a 1-second wait and back up to Releases (false = offline checks)"
+        description: "Fetch one page after a 10-second wait and back up to Releases (false = offline checks)"
         type: boolean
         default: false
 
@@ -36,11 +36,11 @@ jobs:
       - name: Check formatting
         run: python -m ruff format --check .
       - name: Typecheck
-        run: python -m mypy fetch_page.py archive_capture.py batch_capture.py
+        run: python -m mypy fetch_page.py archive_capture.py batch_capture.py site_catalog.py site_capture.py site_restore.py
       - name: Offline tests
         run: python -m unittest discover -s tests -v
       - name: Check Python compilation
-        run: python -m compileall -q fetch_page.py archive_capture.py batch_capture.py tests
+        run: python -m compileall -q fetch_page.py archive_capture.py batch_capture.py site_catalog.py site_capture.py site_restore.py tests
       - name: Test one live page
         id: capture
         if: ${{ inputs.live_probe }}
