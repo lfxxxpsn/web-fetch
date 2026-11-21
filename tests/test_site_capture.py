@@ -5,6 +5,7 @@ import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
+from datetime import UTC, date, datetime
 from email.message import Message
 from pathlib import Path
 from unittest.mock import patch
@@ -106,6 +107,134 @@ class SiteCaptureTests(unittest.TestCase):
             self.assertEqual(len(tags), 4)
         self.assertEqual(summary["by_state"], {"saved": 4, "review": 1})
         self.assertTrue(all(call.args == (10,) for call in self.sleep.call_args_list))
+
+    def test_race_year_filters_backfill_and_refresh(self):
+        clock = self.enterContext(patch("site_capture.datetime", wraps=datetime))
+        clock.now.return_value = datetime(2020, 12, 31, 15, 1, tzinfo=UTC)
+        prior_race = "/race_result/1201901020120191231"
+        race = "/race_result/1202001020120201231"
+        result = "/race_kekka/1202001020120201231"
+        held_race = "/race_result/1202001020120201024"
+        next_race = "/race_result/1202101010120210101"
+        skip_day = date(2020, 10, 24)
+        race_html = (
+            "<html><title>出走馬</title><body><h2>出走馬</h2>"
+            "<table><tr><th>馬名</th><th>オッズ</th></tr>"
+            "<tr><td>試験馬</td><td>3.1</td></tr></table>"
+            "</body></html>"
+        ).encode()
+        result_html = (
+            "<html><title>着順・結果</title><body><h1>着順・結果</h1>"
+            "<table><tr><th>着順</th><th>馬名</th></tr>"
+            "<tr><td>1</td><td>試験馬</td></tr></table>"
+            "</body></html>"
+        ).encode()
+        with closing(sqlite3.connect(self.seed / "catalog.sqlite3")) as db, db:
+            db.executemany(
+                "INSERT INTO pages VALUES (?, ?, 'ready', '', ?)",
+                [
+                    (prior_race, "race", "2019-12-31"),
+                    (race, "race", "2020-12-31"),
+                    (result, "result", "2020-12-31"),
+                    (held_race, "race", "2020-10-24"),
+                    (next_race, "race", "2021-01-01"),
+                ],
+            )
+        (self.seed / "catalog.zip").unlink()
+        package_catalog(self.seed, {})
+        self.responses.update(
+            {
+                prior_race: response(race_html),
+                race: response(race_html),
+                result: response(result_html),
+            }
+        )
+        first = self.root / "indexed-prior-year"
+        _, status = capture_batch(
+            ORIGIN, self.seed / "catalog.zip", first, TAG, "all", 10, race_year=2019
+        )
+        self.assertEqual(status, "success")
+        self.assertEqual(self.calls, ["/robots.txt", prior_race])
+
+        self.calls.clear()
+        dated = self.root / "dated"
+        summary, status = capture_batch(
+            ORIGIN,
+            first / "catalog.zip",
+            dated,
+            "site-batch-2-1",
+            "all",
+            1,
+            race_year=2020,
+            skip_race_day=skip_day,
+        )
+        self.assertEqual(status, "success")
+        self.assertEqual(self.calls, ["/robots.txt", result])
+        self.assertEqual(summary["last_batch"]["race_year"], 2020)
+        self.assertTrue(summary["last_batch"]["has_more"])
+        with ZipFile(dated / "pages.zip") as bundle:
+            self.assertEqual(bundle.read(archive_name(result)), result_html)
+
+        self.calls.clear()
+        resumed = self.root / "resumed-dated"
+        summary, status = capture_batch(
+            ORIGIN,
+            dated / "catalog.zip",
+            resumed,
+            "site-batch-3-1",
+            "all",
+            10,
+            race_year=2020,
+            skip_race_day=skip_day,
+        )
+        self.assertEqual(status, "success")
+        self.assertEqual(self.calls, ["/robots.txt", race])
+        self.assertFalse(summary["last_batch"]["has_more"])
+        with ZipFile(resumed / "pages.zip") as bundle:
+            self.assertEqual(bundle.read(archive_name(race)), race_html)
+
+        self.calls.clear()
+        summary, status = capture_batch(
+            ORIGIN,
+            resumed / "catalog.zip",
+            self.root / "rechecked",
+            "site-batch-4-1",
+            "all",
+            10,
+            race_year=2020,
+            skip_race_day=skip_day,
+            refresh_hours=0,
+        )
+        self.assertEqual(status, "success")
+        self.assertCountEqual(self.calls, ["/robots.txt", race, result])
+        self.assertEqual(summary["last_batch"]["unchanged"], 2)
+
+        self.calls.clear()
+        _, status = capture_batch(
+            ORIGIN,
+            dated / "catalog.zip",
+            self.root / "today",
+            "site-batch-5-1",
+            "all",
+            10,
+            race_year=2021,
+        )
+        self.assertEqual(status, "success")
+        self.assertEqual(self.calls, [])
+
+        self.responses[held_race] = response(b"denied", 403)
+        summary, status = capture_batch(
+            ORIGIN,
+            resumed / "catalog.zip",
+            self.root / "denied-year",
+            "site-batch-6-1",
+            "all",
+            10,
+            race_year=2020,
+        )
+        self.assertEqual(status, "forbidden")
+        self.assertEqual(self.calls, ["/robots.txt", held_race])
+        self.assertFalse(summary["last_batch"]["has_more"])
 
     def test_429_retains_valid_pages_and_persists_retry_guard(self):
         self.responses[JOCKEY] = response(b"limited", 429, retry_after="3600")

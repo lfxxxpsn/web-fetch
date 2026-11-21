@@ -7,7 +7,7 @@ import json
 import re
 import sqlite3
 from contextlib import closing
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.error import URLError
@@ -30,11 +30,13 @@ from site_catalog import (
     address,
     check_hold,
     classify,
+    import_race_backup,
     observe_links,
     package_catalog,
     record_hold,
     restore_catalog,
     summarize,
+    verify_checksum,
     write_checksum,
 )
 
@@ -101,16 +103,27 @@ def validated_html(response: Response, category: str) -> str:
 
 
 def next_pages(
-    db: sqlite3.Connection, category: str, limit: int, refresh_before: str | None = None
+    db: sqlite3.Connection,
+    category: str,
+    limit: int,
+    refresh_before: str | None = None,
+    *,
+    race_dates: tuple[str, str] | None = None,
+    skip_race_day: str | None = None,
 ) -> list[tuple[str, str]]:
+    race_filter = "AND p.race_day >= ? AND p.race_day < ?" if race_dates else ""
+    filters = (category, category, *(race_dates or ()))
+    if skip_race_day:
+        race_filter += " AND p.race_day <> ?"
+        filters += (skip_race_day,)
     if refresh_before is not None:
         return db.execute(
-            """WITH candidates AS (
+            f"""WITH candidates AS (
                    SELECT p.path, p.category, COALESCE(c.checked_at,
                        (SELECT MAX(indexed_at) FROM versions WHERE versions.path=p.path),
                        '') AS checked_at
                    FROM pages p LEFT JOIN page_checks c ON c.path=p.path
-                   WHERE p.decision='ready' AND (?='all' OR p.category=?)
+                   WHERE p.decision='ready' AND (?='all' OR p.category=?) {race_filter}
                    AND (EXISTS (SELECT 1 FROM versions WHERE versions.path=p.path)
                         OR EXISTS (SELECT 1 FROM missing WHERE missing.path=p.path))
                )
@@ -122,17 +135,17 @@ def next_pages(
                    AND julianday(d.lastmod) <= julianday(d.seen_at)
                ) DESC, checked_at, path
                LIMIT ?""",
-            (category, category, refresh_before, limit),
+            (*filters, refresh_before, limit),
         ).fetchall()
     return db.execute(
-        """SELECT path, category FROM pages
-           WHERE decision='ready' AND (?='all' OR category=?)
-           AND NOT EXISTS (SELECT 1 FROM versions WHERE versions.path=pages.path)
-           AND NOT EXISTS (SELECT 1 FROM missing WHERE missing.path=pages.path)
+        f"""SELECT p.path, p.category FROM pages p
+           WHERE p.decision='ready' AND (?='all' OR p.category=?) {race_filter}
+           AND NOT EXISTS (SELECT 1 FROM versions WHERE versions.path=p.path)
+           AND NOT EXISTS (SELECT 1 FROM missing WHERE missing.path=p.path)
            ORDER BY CASE category WHEN 'entry' THEN 0 WHEN 'result' THEN 1
                     WHEN 'race' THEN 2 ELSE 3 END, path
            LIMIT ?""",
-        (category, category, limit),
+        (*filters, limit),
     ).fetchall()
 
 
@@ -177,6 +190,9 @@ def capture_batch(
     limit: int,
     *,
     refresh_hours: int | None = None,
+    race_year: int | None = None,
+    skip_race_day: date | None = None,
+    race_backup: tuple[str, Path] | None = None,
 ) -> tuple[dict[str, object], str]:
     if not BATCH_TAG.fullmatch(tag) or category not in PAGE_CATEGORIES:
         raise ValueError("Invalid archive tag or page category.")
@@ -184,6 +200,12 @@ def capture_batch(
         raise ValueError("Invalid per-run page limit.")
     if refresh_hours is not None and not 0 <= refresh_hours <= 24 * 365:
         raise ValueError("Invalid minimum age for refreshing pages.")
+    if race_year is not None and not 1 <= race_year < 9999:
+        raise ValueError("Invalid race year.")
+    if skip_race_day is not None and skip_race_day.year != race_year:
+        raise ValueError("The excluded race date must be in the selected year.")
+    if race_backup is not None:
+        verify_checksum(race_backup[1])
     output.mkdir(parents=True, exist_ok=False)
     database = output / "catalog.sqlite3"
     restore_catalog(database, previous, origin)
@@ -194,6 +216,14 @@ def capture_batch(
         if refresh_hours is not None
         else None
     )
+    race_dates = None
+    if race_year is not None:
+        today_in_japan = started.astimezone(timezone(timedelta(hours=9))).date()
+        race_dates = (
+            date(race_year, 1, 1).isoformat(),
+            min(date(race_year + 1, 1, 1), today_in_japan).isoformat(),
+        )
+    excluded_day = skip_race_day.isoformat() if skip_race_day else None
     site = Site(origin, Checkpoint("", sha256(origin.encode())))
     saved: dict[str, dict[str, str | int]] = {}
     absent: dict[str, str] = {}
@@ -209,9 +239,14 @@ def capture_batch(
         db.execute("PRAGMA foreign_keys=ON")
         db.executescript(SCHEMA)
         check_hold(db)
-        pending = next_pages(db, category, limit, cutoff)
         try:
-            if pending:
+            if race_backup is not None:
+                site.read_robots()
+                import_race_backup(db, site, *race_backup, now)
+            pending = next_pages(
+                db, category, limit, cutoff, race_dates=race_dates, skip_race_day=excluded_day
+            )
+            if pending and race_backup is None:
                 site.read_robots()
             for path, _ in pending:
                 last_path = path
@@ -278,6 +313,17 @@ def capture_batch(
             "unchanged": unchanged,
             "reused_version": reused,
         }
+        if race_year is not None:
+            batch["race_year"] = race_year
+            batch["has_more"] = (
+                status == "success"
+                and cutoff is None
+                and bool(
+                    next_pages(db, category, 1, race_dates=race_dates, skip_race_day=excluded_day)
+                )
+            )
+        if excluded_day is not None:
+            batch["skipped_race_day"] = excluded_day
         hold = db.execute("SELECT retry_at FROM site_hold WHERE id=1").fetchone()
         if hold:
             batch["retry_at"] = hold[0]
@@ -300,7 +346,17 @@ def main() -> int:
     parser.add_argument(
         "--refresh-hours", type=int, help="Check archived or missing pages this old"
     )
+    parser.add_argument(
+        "--race-year", type=int, help="Select dated pages before the current Japan date"
+    )
+    parser.add_argument("--skip-race-day", type=date.fromisoformat, metavar="YYYY-MM-DD")
+    parser.add_argument("--race-backup", nargs=2, metavar=("TAG", "FILE"))
     args = parser.parse_args()
+    if args.race_year is not None and not 1 <= args.race_year < 9999:
+        parser.error("--race-year must be between 1 and 9998.")
+    if args.skip_race_day is not None and args.skip_race_day.year != args.race_year:
+        parser.error("--skip-race-day must be in the selected --race-year.")
+    race_backup = (args.race_backup[0], Path(args.race_backup[1])) if args.race_backup else None
     try:
         target = urlsplit(load_target_url())
         summary, status = capture_batch(
@@ -311,6 +367,9 @@ def main() -> int:
             args.category,
             args.limit,
             refresh_hours=args.refresh_hours,
+            race_year=args.race_year,
+            skip_race_day=args.skip_race_day,
+            race_backup=race_backup,
         )
     except (ValueError, TypeError, OSError, KeyError, BadZipFile, sqlite3.Error) as error:
         message = (

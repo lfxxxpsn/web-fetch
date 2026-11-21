@@ -25,6 +25,23 @@ on:
         description: "Refresh mode only: minimum hours since the last check"
         type: number
         default: 24
+      race_year:
+        description: "Optional year for completed race and official result pages, e.g. 2026"
+        type: string
+        default: ""
+
+      batches:
+        description: "Maximum consecutive yearly backfill batches (1–100)"
+        type: number
+        default: 1
+      skip_race_day:
+        description: "Optional race date to leave pending, YYYY-MM-DD"
+        type: string
+        default: ""
+      race_backup:
+        description: "Optional race-day Release tag to include in the first batch"
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -40,6 +57,7 @@ jobs:
     outputs:
       result: ${{ steps.batch.outputs.result }}
       artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      has_more: ${{ steps.batch.outputs.has_more }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -53,9 +71,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           PREVIOUS: ${{ inputs.previous_catalog }}
+          RACE_BACKUP: ${{ inputs.race_backup }}
         run: |
           [[ "$PREVIOUS" =~ ^(inventory|site-batch)-[0-9]+-[0-9]+$ ]]
           gh release download "$PREVIOUS" --pattern 'catalog.zip*' --dir previous
+          if [[ -n "$RACE_BACKUP" ]]; then
+            [[ "$RACE_BACKUP" =~ ^pilot-[0-9]+-[0-9]+$ ]]
+            gh release download "$RACE_BACKUP" --pattern 'batch.zip*' --dir race-backup
+          fi
       - name: Capture selected HTML
         id: batch
         shell: bash
@@ -65,13 +88,30 @@ jobs:
           LIMIT: ${{ inputs.limit }}
           MODE: ${{ inputs.mode }}
           MIN_AGE: ${{ inputs.min_age_hours }}
+          RACE_YEAR: ${{ inputs.race_year }}
+          BATCHES: ${{ inputs.batches }}
+          SKIP_RACE_DAY: ${{ inputs.skip_race_day }}
+          RACE_BACKUP: ${{ inputs.race_backup }}
         run: |
+          [[ "$BATCHES" =~ ^([1-9]|[1-9][0-9]|100)$ ]]
+          if (( BATCHES > 1 )); then
+            [[ "$MODE" == backfill && -n "$RACE_YEAR" ]]
+          fi
           args=()
           case "$MODE" in
             backfill) ;;
             refresh) args+=(--refresh-hours "$MIN_AGE") ;;
             *) exit 2 ;;
           esac
+          if [[ -n "$RACE_YEAR" ]]; then
+            args+=(--race-year "$RACE_YEAR")
+          fi
+          if [[ -n "$SKIP_RACE_DAY" ]]; then
+            args+=(--skip-race-day "$SKIP_RACE_DAY")
+          fi
+          if [[ -n "$RACE_BACKUP" ]]; then
+            args+=(--race-backup "$RACE_BACKUP" race-backup/batch.zip)
+          fi
           code=0
           python site_capture.py --previous previous/catalog.zip --output backup \
             --tag "site-batch-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
@@ -79,7 +119,8 @@ jobs:
           for file in catalog.zip catalog.zip.sha256 pages.zip pages.zip.sha256; do
             test -s "backup/$file"
           done
-          printf 'result=%s\n' "$code" >> "$GITHUB_OUTPUT"
+          has_more=$(python -c 'import json; print(str(json.load(open("backup/inventory.json"))["last_batch"].get("has_more", False)).lower())')
+          printf 'result=%s\nhas_more=%s\n' "$code" "$has_more" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v7
         id: upload
         with:
@@ -96,6 +137,8 @@ jobs:
     needs: capture
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    outputs:
+      checkpoint: ${{ steps.release.outputs.checkpoint }}
     permissions:
       contents: write
     steps:
@@ -104,6 +147,7 @@ jobs:
           artifact-ids: ${{ needs.capture.outputs.artifact_id }}
           path: backup
       - name: Verify and publish the page archives and updated catalog
+        id: release
         shell: bash
         working-directory: backup
         env:
@@ -125,4 +169,34 @@ jobs:
             --target "$GITHUB_SHA" --title "Site HTML backup: ${GITHUB_RUN_ID}" \
             --notes-file "$notes" --draft --latest=false
           gh release edit "$tag" --draft=false --latest=false
+          printf '[Backup Release](%s/%s/releases/tag/%s)\n' \
+            "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$tag" >> "$GITHUB_STEP_SUMMARY"
           test "$BATCH_STATUS" = 0
+          printf 'checkpoint=%s\n' "$tag" >> "$GITHUB_OUTPUT"
+
+  continue_backfill:
+    needs: [capture, publish]
+    if: ${{ success() && inputs.batches > 1 && needs.capture.outputs.has_more == 'true' && github.run_attempt == 1 }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Continue from the published checkpoint
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          CHECKPOINT: ${{ needs.publish.outputs.checkpoint }}
+          CATEGORY: ${{ inputs.category }}
+          LIMIT: ${{ inputs.limit }}
+          RACE_YEAR: ${{ inputs.race_year }}
+          BATCHES: ${{ inputs.batches }}
+          SKIP_RACE_DAY: ${{ inputs.skip_race_day }}
+        run: |
+          [[ "$CHECKPOINT" =~ ^site-batch-[0-9]+-[0-9]+$ ]]
+          next_run=$(gh workflow run site-backup.yml --ref "$CHECKPOINT" \
+            -f previous_catalog="$CHECKPOINT" -f category="$CATEGORY" \
+            -f limit="$LIMIT" -f mode=backfill -f race_year="$RACE_YEAR" \
+            -f batches="$(( BATCHES - 1 ))" -f skip_race_day="$SKIP_RACE_DAY")
+          printf 'Published checkpoint: `%s`\n\nNext run: %s\n' "$CHECKPOINT" "$next_run" >> "$GITHUB_STEP_SUMMARY"
