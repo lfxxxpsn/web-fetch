@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       live_probe:
-        description: "Fetch one page after a 10-second wait and back up to Releases (false = offline checks)"
+        description: "Fetch one page after a 5-second wait and back up to Releases (false = offline checks)"
         type: boolean
         default: false
 

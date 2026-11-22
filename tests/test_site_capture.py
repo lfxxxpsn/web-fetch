@@ -106,7 +106,7 @@ class SiteCaptureTests(unittest.TestCase):
             self.assertEqual(tags[HORSE], TAG)
             self.assertEqual(len(tags), 4)
         self.assertEqual(summary["by_state"], {"saved": 4, "review": 1})
-        self.assertTrue(all(call.args == (10,) for call in self.sleep.call_args_list))
+        self.assertTrue(all(call.args == (5,) for call in self.sleep.call_args_list))
 
     def test_race_year_filters_backfill_and_refresh(self):
         clock = self.enterContext(patch("site_capture.datetime", wraps=datetime))

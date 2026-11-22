@@ -10,7 +10,7 @@
 
 ## 請求行為
 
-- 每次網站請求前至少等待 10 秒，且只發出一次 GET。批次流程會依 robots.txt 採用更長的等待時間。
+- 每次網站請求前至少等待 5 秒，且只發出一次 GET。批次流程會依 robots.txt 採用更長的等待時間。
 - 不自動重試、不跟隨重新導向、不執行 JavaScript，也不下載圖片、CSS 或其他資源。
 - Workflow 使用固定 concurrency group，避免這個儲存庫的測試工作重疊。
 - 403、429、其他非 200 回應或缺少賽事表格時，以失敗狀態結束；429 的 Retry-After 會記入報告，本次不重試。
@@ -47,13 +47,13 @@ Secret 只注入實際抓取的步驟；離線檢查不需要 Secret。未設定
 此工作區尚未連接 GitHub 遠端，因此目前已完成程式與 workflow 的 Secret 讀取設定，尚未在 GitHub 建立實際 Secret。設定方式參閱 [GitHub 官方說明](https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/use-secrets)。
 
 - `live_probe=false`（預設）：僅執行 lint、format、型別、離線測試與編譯檢查。
-- `live_probe=true`：上述檢查通過後，等待 10 秒並實際請求一頁，成功後打包並發布至 Releases。
+- `live_probe=true`：上述檢查通過後，等待 5 秒並實際請求一頁，成功後打包並發布至 Releases。
 
 成功或被網站拒絕時，都可在該次執行的 Artifacts 下載診斷結果，保留 14 天。若前置檢查失敗，尚未執行抓取，便不會產生抓取報告。
 
 ## 賽事批次備份
 
-在 **Actions → Race batch pilot → Run workflow** 輸入一個已結束的賽事日（`race_day`，格式 `YYYY-MM-DD`）。程式讀取站方 robots.txt、主 sitemap 和賽事子清單。每場保存賽事頁與頁內實際連結的正式賽果頁。單頁與批次共用 workflow 的 concurrency group，網站請求逐一執行，回應完成後至少間隔 10 秒。
+在 **Actions → Race batch pilot → Run workflow** 輸入一個已結束的賽事日（`race_day`，格式 `YYYY-MM-DD`）。程式讀取站方 robots.txt、主 sitemap 和賽事子清單。每場保存賽事頁與頁內實際連結的正式賽果頁。單頁與批次共用 workflow 的 concurrency group，網站請求逐一執行，回應完成後至少間隔 5 秒。
 
 - `mode=pilot` 選三場。測試續跑時先將 `pause_after` 設為 `1`，保存一頁後暫停。第二次用相同日期，在 `resume_run_id` 填入前次 Actions 執行 ID，將 `pause_after` 設為 `6` 以補齊。
 - `mode=day-list` 列出當天所有 sitemap 賽事並固定清單。可沿用同日的三場試跑進度。此模式只發送盤點請求。
@@ -155,7 +155,7 @@ try {
 }
 ```
 
-請勿同時從多個本機程序或不同儲存庫執行。腳本不實作跨程序／跨儲存庫鎖；GitHub concurrency 只涵蓋本儲存庫的 workflow。需要更長等待時可傳入 `--delay-seconds 180`，無法低於 10 秒。
+請勿同時從多個本機程序或不同儲存庫執行。腳本不實作跨程序／跨儲存庫鎖；GitHub concurrency 只涵蓋本儲存庫的 workflow。需要更長等待時可傳入 `--delay-seconds 180`，無法低於 5 秒。
 
 ## 產出
 

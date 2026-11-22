@@ -90,7 +90,7 @@ class SiteCatalogTests(unittest.TestCase):
         self.assertEqual(summary["known_urls"], 7)
         self.assertEqual(summary["sitemap_urls_ever_seen"], 2)
         self.assertEqual(self.calls, ["/robots.txt", "/sitemap.gz", "/sitemap_race.gz"])
-        self.assertEqual([args.args[0] for args in self.sleep.call_args_list], [10, 10, 10])
+        self.assertEqual([args.args[0] for args in self.sleep.call_args_list], [5, 5, 5])
         with closing(sqlite3.connect(self.root / "inventory/catalog.sqlite3")) as db:
             self.assertEqual(
                 db.execute("SELECT path, archive_tag, member FROM versions").fetchall(),

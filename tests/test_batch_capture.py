@@ -88,7 +88,7 @@ class BatchTests(unittest.TestCase):
             [
                 event
                 for path in ("/robots.txt", "/sitemap.gz", "/sitemap_race.gz", RACES[0])
-                for event in (("wait", 10), ("get", path))
+                for event in (("wait", 5), ("get", path))
             ],
         )
         self.events.clear()
@@ -115,7 +115,7 @@ class BatchTests(unittest.TestCase):
         state = run_batch(ORIGIN, DAY, self.root / "longer-delay", 1, None)
         self.assertEqual(state.requests_this_run, 4)
         self.assertEqual(
-            [value for action, value in self.events if action == "wait"], [10, 25, 25, 25]
+            [value for action, value in self.events if action == "wait"], [5, 25, 25, 25]
         )
 
     def test_missing_and_cross_site_result_links_are_not_requested(self):
