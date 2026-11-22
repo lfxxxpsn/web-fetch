@@ -19,6 +19,7 @@ from batch_capture import (
     Checkpoint,
     Site,
     Unavailable,
+    UnexpectedResponse,
     archive_name,
     official_result,
     sha256,
@@ -48,6 +49,7 @@ ERROR_HEADING = re.compile(
     r"verify you are human|service unavailable|page not found",
     re.IGNORECASE,
 )
+MEDIA_TYPE = re.compile(r"[a-z0-9][a-z0-9.+_-]{0,69}/[a-z0-9][a-z0-9.+_-]{0,69}")
 REQUIRED_MARKERS = {
     "horse": ("競走馬", "出走履歴", "の情報"),
     "jockey": ("騎手の成績", "出走予定・履歴", "騎手成績"),
@@ -181,6 +183,30 @@ def record_check(
         db.execute("INSERT INTO page_changes VALUES (?, ?, ?, ?, ?)", data)
 
 
+def failure_details(
+    stage: str, error: Exception, response: Response | None
+) -> dict[str, str | int | None]:
+    if isinstance(error, (Blocked, UnexpectedResponse)):
+        response = error.response
+    status = response.status if response is not None else None
+    media_type = None
+    if response is not None and response.headers.get("Content-Type") is not None:
+        media_type = response.headers.get_content_type()
+    if isinstance(error, Blocked):
+        status = error.status
+    cause = (
+        error.reason
+        if isinstance(error, URLError) and isinstance(error.reason, Exception)
+        else error
+    )
+    return {
+        "stage": stage,
+        "error_type": type(cause).__name__,
+        "http_status": status,
+        "content_type": media_type if media_type and MEDIA_TYPE.fullmatch(media_type) else None,
+    }
+
+
 def capture_batch(
     origin: str,
     previous: Path,
@@ -231,6 +257,9 @@ def capture_batch(
     reused = 0
     status = "success"
     last_path = None
+    failure = None
+    stage = "read_robots"
+    response: Response | None = None
     with (
         closing(sqlite3.connect(database)) as db,
         db,
@@ -242,14 +271,19 @@ def capture_batch(
         try:
             if race_backup is not None:
                 site.read_robots()
+                stage = "import_race_backup"
                 import_race_backup(db, site, *race_backup, now)
+            stage = "select_pages"
             pending = next_pages(
                 db, category, limit, cutoff, race_dates=race_dates, skip_race_day=excluded_day
             )
             if pending and race_backup is None:
+                stage = "read_robots"
                 site.read_robots()
             for path, _ in pending:
                 last_path = path
+                stage = "prepare_page"
+                response = None
                 if address(origin, "/", path) != path:
                     raise ValueError("The catalog contains an invalid same-site path.")
                 current = classify(path, site.robots)
@@ -260,6 +294,7 @@ def capture_batch(
                 if current[1] != "ready":
                     continue
                 prior = prior_state(db, path)
+                stage = "request_page"
                 try:
                     response = site.get(path)
                 except Unavailable as error:
@@ -269,7 +304,9 @@ def capture_batch(
                     )
                     record_check(db, path, now, tag, prior, ("missing", None))
                     continue
+                stage = "validate_html"
                 html = validated_html(response, current[0])
+                stage = "save_html"
                 digest = sha256(response.body)
                 member = archive_name(path)
                 if db.execute(
@@ -293,12 +330,15 @@ def capture_batch(
                     }
                 db.execute("DELETE FROM missing WHERE path=?", (path,))
                 record_check(db, path, now, tag, prior, ("saved", digest))
+                stage = "discover_links"
                 observe_links(db, site, path, html, now)
         except Blocked as error:
             status = "forbidden" if error.status == 403 else "rate_limited"
             record_hold(db, error)
-        except OSError, ValueError, URLError, LookupError:
+            failure = failure_details(stage, error, response)
+        except (OSError, ValueError, LookupError) as error:
             status = "failed"
+            failure = failure_details(stage, error, response)
         batch: dict[str, object] = {
             "format_version": 1,
             "tag": tag,
@@ -313,6 +353,8 @@ def capture_batch(
             "unchanged": unchanged,
             "reused_version": reused,
         }
+        if failure is not None:
+            batch["failure"] = failure
         if race_year is not None:
             batch["race_year"] = race_year
             batch["has_more"] = (
@@ -378,8 +420,11 @@ def main() -> int:
             else ("Could not restore or initialize the site backup batch.")
         )
         parser.exit(1, message + "\n")
-    # Keep site-relative URLs and archive paths in the private assets instead of job logs.
+    # Keep site-relative paths and exception text out of job logs.
     print(f"{status}; {summary['last_batch_saved']} new HTML pages.")
+    last_batch = summary["last_batch"]
+    if isinstance(last_batch, dict) and "failure" in last_batch:
+        print(json.dumps({"failure": last_batch["failure"]}))
     return 0 if status == "success" else 2
 
 

@@ -87,9 +87,12 @@ def same_site_path(origin: str, url: str) -> str | None:
 
 
 class Blocked(ValueError):
-    def __init__(self, status: int, retry_after: str | None) -> None:
+    def __init__(
+        self, status: int, retry_after: str | None, *, response: Response | None = None
+    ) -> None:
         super().__init__(f"HTTP {status}; stopped the batch without retry.")
         self.status = status
+        self.response = response
         self.retry_at = None
         if status == 429:
             now = datetime.now(UTC)
@@ -106,6 +109,12 @@ class Blocked(ValueError):
 class Unavailable(ValueError):
     def __init__(self, status: int) -> None:
         super().__init__(f"HTTP {status}")
+
+
+class UnexpectedResponse(ValueError):
+    def __init__(self, response: Response) -> None:
+        super().__init__(f"HTTP {response.status}; stopped without retry or redirect.")
+        self.response = response
 
 
 class Site:
@@ -125,11 +134,11 @@ class Site:
         self.checkpoint.requests_this_run += 1
         response = fetch_once(self.origin + path)
         if response.status in (403, 429):
-            raise Blocked(response.status, response.headers.get("Retry-After"))
+            raise Blocked(response.status, response.headers.get("Retry-After"), response=response)
         if response.status in (404, 410):
             raise Unavailable(response.status)
         if response.status != 200:
-            raise ValueError(f"HTTP {response.status}; stopped without retry or redirect.")
+            raise UnexpectedResponse(response)
         return response
 
     def read_robots(self) -> None:

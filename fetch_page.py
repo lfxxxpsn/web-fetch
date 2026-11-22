@@ -212,14 +212,24 @@ def extract_tables(response: Response) -> list[Table]:
     parser = TablesParser()
     parser.feed(text)
     visible = re.sub(r"\s+", "", "".join(parser.visible))
-    race_tables = []
-    for table in parser.tables:
-        cells = re.sub(r"\s+", "", "".join(cell.text for row in table.rows for cell in row))
-        if len(table.rows) >= 2 and "馬名" in cells and "オッズ" in cells:
-            race_tables.append(table)
-    if "出走馬" not in visible or not race_tables:
-        raise ValueError("Expected race table is missing; this may be an error/challenge page.")
-    return parser.tables
+    if "出走馬" in visible:
+        canceled = any(fragment.strip() == "競争中止" for fragment in parser.visible)
+        for table in parser.tables:
+            if len(table.rows) < 2:
+                continue
+            cells = re.sub(r"\s+", "", "".join(cell.text for row in table.rows for cell in row))
+            if "馬名" in cells and "オッズ" in cells:
+                return parser.tables
+            if canceled:
+                headers = [re.sub(r"\s+", "", cell.text) for cell in table.rows[0]]
+                if {"馬名", "斤量", "騎手名", "調教師"}.issubset(headers):
+                    name_column = headers.index("馬名")
+                    if any(
+                        len(row) > name_column and row[name_column].text.strip()
+                        for row in table.rows[1:]
+                    ):
+                        return parser.tables
+    raise ValueError("Expected race table is missing; this may be an error/challenge page.")
 
 
 def capture(url: str, output_root: Path, delay: int = MIN_DELAY) -> tuple[bool, Path]:

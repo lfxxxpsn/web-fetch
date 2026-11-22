@@ -9,6 +9,7 @@ from datetime import UTC, date, datetime
 from email.message import Message
 from pathlib import Path
 from unittest.mock import patch
+from urllib.error import URLError
 from zipfile import ZipFile
 
 from batch_capture import archive_name, sha256
@@ -74,7 +75,10 @@ class SiteCaptureTests(unittest.TestCase):
         self.assertTrue(url.startswith(ORIGIN + "/"))
         path = url.removeprefix(ORIGIN)
         self.calls.append(path)
-        return self.responses[path]
+        reply = self.responses[path]
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
 
     def test_next_runner_deduplicates_and_archives_only_new_html(self):
         first = self.root / "first"
@@ -241,6 +245,15 @@ class SiteCaptureTests(unittest.TestCase):
         first = self.root / "limited"
         summary, status = capture_batch(ORIGIN, self.seed / "catalog.zip", first, TAG, "all", 10)
         self.assertEqual(status, "rate_limited")
+        self.assertEqual(
+            summary["last_batch"]["failure"],
+            {
+                "stage": "request_page",
+                "error_type": "Blocked",
+                "http_status": 429,
+                "content_type": "text/html",
+            },
+        )
         self.assertEqual(self.calls, ["/robots.txt", ARTICLE, JOCKEY])
         self.assertEqual(summary["last_batch_saved"], 1)
         self.calls.clear()
@@ -275,9 +288,53 @@ class SiteCaptureTests(unittest.TestCase):
         self.assertEqual(summary["by_state"], {"pending": 2, "missing": 1, "review": 1})
         with ZipFile(output / "pages.zip") as bundle:
             self.assertEqual(bundle.namelist(), ["batch.json"])
+            batch = json.loads(bundle.read("batch.json"))
+            self.assertEqual(batch["missing"], {ARTICLE: "HTTP 410"})
             self.assertEqual(
-                json.loads(bundle.read("batch.json"))["missing"], {ARTICLE: "HTTP 410"}
+                batch["failure"],
+                {
+                    "stage": "validate_html",
+                    "error_type": "ValueError",
+                    "http_status": 200,
+                    "content_type": "text/html",
+                },
             )
+
+    def test_request_diagnostics_keep_status_and_omit_exception_text(self):
+        cases = (
+            (
+                "status",
+                response(b"unavailable", 503, content_type="text/plain; charset=utf-8"),
+                "UnexpectedResponse",
+                503,
+                "text/plain",
+            ),
+            (
+                "timeout",
+                URLError(TimeoutError("https://example.invalid/?token=private")),
+                "TimeoutError",
+                None,
+                None,
+            ),
+        )
+        for name, reply, error_type, http_status, content_type in cases:
+            with self.subTest(name=name):
+                self.calls.clear()
+                self.responses[HORSE] = reply
+                summary, status = capture_batch(
+                    ORIGIN, self.seed / "catalog.zip", self.root / name, TAG, "horse", 1
+                )
+                self.assertEqual(status, "failed")
+                self.assertEqual(self.calls, ["/robots.txt", HORSE])
+                self.assertEqual(
+                    summary["last_batch"]["failure"],
+                    {
+                        "stage": "request_page",
+                        "error_type": error_type,
+                        "http_status": http_status,
+                        "content_type": content_type,
+                    },
+                )
 
     def test_newly_disallowed_target_is_not_requested(self):
         self.responses["/robots.txt"] = response(

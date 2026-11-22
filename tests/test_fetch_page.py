@@ -102,6 +102,30 @@ class ExtractionTests(unittest.TestCase):
         self.assertEqual(tables[0].rows[1][0].rowspan, "2")
         self.assertEqual(tables[0].rows[0][0].tag, "th")
 
+    def test_accepts_canceled_race_entry_table_only_when_marked_and_populated(self):
+        canceled_race = """<html><body><p>競争中止</p><h2>出走馬</h2><table>
+<tr><th>馬名</th><th>斤量</th><th>騎手名</th><th>調教師</th></tr>
+<tr><td>テストホース</td><td>55.0</td><td>テスト騎手</td><td>テスト調教師</td></tr>
+</table></body></html>"""
+        cases = (
+            ("marked and populated", canceled_race, True),
+            ("missing cancellation marker", canceled_race.replace("<p>競争中止</p>", ""), False),
+            ("empty runner name", canceled_race.replace("テストホース", ""), False),
+            (
+                "cancellation marker without runners",
+                "<html><body><p>競争中止</p><h2>出走馬</h2></body></html>",
+                False,
+            ),
+        )
+        for name, body, accepted in cases:
+            with self.subTest(case=name):
+                if accepted:
+                    tables = probe.extract_tables(response(body))
+                    self.assertEqual(tables[0].rows[1][0].text, "テストホース")
+                else:
+                    with self.assertRaisesRegex(ValueError, "race table"):
+                        probe.extract_tables(response(body))
+
     def test_nested_table_does_not_lose_parent_cell_text(self):
         body = HTML.replace(
             "テストホース &amp; 馬",
