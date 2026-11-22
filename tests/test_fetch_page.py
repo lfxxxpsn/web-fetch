@@ -126,6 +126,38 @@ class ExtractionTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "race table"):
                         probe.extract_tables(response(body))
 
+    def test_accepts_empty_canceled_race_table_only_with_title_and_matching_headers(self):
+        body = """<html><head><title>3歳未勝利 京都競馬 第1レース 2025年2月8日 予想</title></head>
+<body><p>競争中止</p><h2>出走馬</h2><table>
+<tr><th>馬名</th><th>総合値</th><th>SP値</th><th>AG値</th><th>SA値</th></tr>
+</table></body></html>"""
+        cases = (
+            ("canceled race with identifiable title", body, True),
+            ("missing cancellation marker", body.replace("<p>競争中止</p>", ""), False),
+            (
+                "missing race title",
+                body.replace(
+                    "<title>3歳未勝利 京都競馬 第1レース 2025年2月8日 予想</title>",
+                    "<title>出走馬 予想</title>",
+                ),
+                False,
+            ),
+            (
+                "missing matching empty table",
+                body.replace("<th>SA値</th>", "<th>人気</th>"),
+                False,
+            ),
+        )
+        for name, candidate, accepted in cases:
+            with self.subTest(case=name):
+                if accepted:
+                    tables = probe.extract_tables(response(candidate))
+                    self.assertEqual(len(tables[0].rows), 1)
+                    self.assertEqual(tables[0].rows[0][-1].text, "SA値")
+                else:
+                    with self.assertRaisesRegex(ValueError, "race table"):
+                        probe.extract_tables(response(candidate))
+
     def test_nested_table_does_not_lose_parent_cell_text(self):
         body = HTML.replace(
             "テストホース &amp; 馬",

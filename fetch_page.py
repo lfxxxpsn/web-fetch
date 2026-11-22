@@ -90,10 +90,14 @@ class TablesParser(HTMLParser):
         self.cell: Cell | None = None
         self.ignored: str | None = None
         self.visible: list[str] = []
+        self.in_title = False
+        self.title: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if tag in {"script", "style"}:
             self.ignored = tag
+        if tag == "title":
+            self.in_title = True
         if self.ignored:
             return
         attributes = dict(attrs)
@@ -121,12 +125,16 @@ class TablesParser(HTMLParser):
     def handle_data(self, data: str) -> None:
         if not self.ignored:
             self.visible.append(data)
+            if self.in_title:
+                self.title.append(data)
             if self.cell is not None:
                 self.cell.text += data
 
     def handle_endtag(self, tag: str) -> None:
         if tag == self.ignored:
             self.ignored = None
+        elif tag == "title":
+            self.in_title = False
         elif self.ignored:
             return
         elif tag == "table" and self.stack:
@@ -214,6 +222,12 @@ def extract_tables(response: Response) -> list[Table]:
     visible = re.sub(r"\s+", "", "".join(parser.visible))
     if "出走馬" in visible:
         canceled = any(fragment.strip() == "競争中止" for fragment in parser.visible)
+        race_title = " ".join(parser.title)
+        has_race_title = bool(
+            re.search(r"(?:札幌|函館|福島|新潟|東京|中山|中京|京都|阪神|小倉)競馬", race_title)
+            and re.search(r"第\s*\d+\s*レース", race_title)
+            and re.search(r"\d{4}年\s*\d{1,2}月\s*\d{1,2}日", race_title)
+        )
         for table in parser.tables:
             if len(table.rows) < 2:
                 continue
@@ -229,6 +243,16 @@ def extract_tables(response: Response) -> list[Table]:
                         for row in table.rows[1:]
                     ):
                         return parser.tables
+        if canceled and has_race_title:
+            required_empty_headers = {"馬名", "総合値", "SP値", "AG値", "SA値"}
+            for table in parser.tables:
+                if len(table.rows) != 1:
+                    continue
+                empty_headers = {
+                    re.sub(r"\s+", "", cell.text) for cell in table.rows[0] if cell.tag == "th"
+                }
+                if required_empty_headers.issubset(empty_headers):
+                    return parser.tables
     raise ValueError("Expected race table is missing; this may be an error/challenge page.")
 
 

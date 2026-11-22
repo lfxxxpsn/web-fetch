@@ -32,6 +32,7 @@ from site_catalog import (
     check_hold,
     classify,
     import_race_backup,
+    mark_rescheduled_results,
     observe_links,
     package_catalog,
     record_hold,
@@ -274,6 +275,7 @@ def capture_batch(
                 stage = "import_race_backup"
                 import_race_backup(db, site, *race_backup, now)
             stage = "select_pages"
+            mark_rescheduled_results(db)
             pending = next_pages(
                 db, category, limit, cutoff, race_dates=race_dates, skip_race_day=excluded_day
             )
@@ -339,6 +341,7 @@ def capture_batch(
         except (OSError, ValueError, LookupError) as error:
             status = "failed"
             failure = failure_details(stage, error, response)
+        mark_rescheduled_results(db)
         batch: dict[str, object] = {
             "format_version": 1,
             "tag": tag,

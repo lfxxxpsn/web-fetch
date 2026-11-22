@@ -461,6 +461,66 @@ class SiteCaptureTests(unittest.TestCase):
             self.assertEqual(summary["last_batch"]["unchanged"], 1)
             previous = output
 
+    def test_verified_reschedule_is_excluded_even_when_discovered_again(self):
+        original = "/race_kekka/8202501030120250208"
+        replacement = "/race_kekka/8202501030120250210"
+        unverified = "/race_kekka/8202501030220250208"
+        other_course = "/race_kekka/0202501050120250208"
+        result_html = (
+            "<html><title>着順・結果</title><body><h1>着順・結果</h1>"
+            "<table><tr><th>着順</th><th>馬名</th></tr>"
+            "<tr><td>1</td><td>試験馬</td></tr></table></body></html>"
+        ).encode()
+        digest = sha256(result_html)
+        with closing(sqlite3.connect(self.seed / "catalog.sqlite3")) as db, db:
+            db.executemany(
+                "INSERT INTO pages VALUES (?, 'result', 'ready', '', ?)",
+                [
+                    (original, "2025-02-08"),
+                    (unverified, "2025-02-08"),
+                    (other_course, "2025-02-08"),
+                    (replacement, "2025-02-10"),
+                ],
+            )
+            db.execute(
+                "INSERT INTO versions VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    replacement,
+                    digest,
+                    "site-batch-99-1",
+                    archive_name(replacement),
+                    len(result_html),
+                    "2025-02-11T00:00:00+00:00",
+                ),
+            )
+        (self.seed / "catalog.zip").unlink()
+        package_catalog(self.seed, {})
+        linked = result_html.replace(b"</body>", f'<a href="{original}">1R</a></body>'.encode())
+        self.responses[other_course] = response(linked)
+        self.responses[unverified] = response(result_html)
+        output = self.root / "rescheduled"
+        summary, status = capture_batch(
+            ORIGIN, self.seed / "catalog.zip", output, TAG, "result", 2, race_year=2025
+        )
+        self.assertEqual(status, "success")
+        self.assertEqual(self.calls, ["/robots.txt", other_course, unverified])
+        self.assertFalse(summary["last_batch"]["has_more"])
+        with closing(sqlite3.connect(output / "catalog.sqlite3")) as db:
+            self.assertEqual(
+                db.execute(
+                    "SELECT decision, reason FROM pages WHERE path=?", (original,)
+                ).fetchone(),
+                ("excluded", f"Rescheduled to {replacement}"),
+            )
+            self.assertEqual(
+                db.execute("SELECT source FROM discoveries WHERE path=?", (original,)).fetchone(),
+                ("link:" + other_course,),
+            )
+            self.assertEqual(
+                db.execute("SELECT sha256 FROM versions WHERE path=?", (replacement,)).fetchone(),
+                (digest,),
+            )
+
     def test_restore_detects_changed_member_after_zip_checksum_is_recomputed(self):
         releases = self.root / "releases"
         releases.mkdir()

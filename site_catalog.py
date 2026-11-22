@@ -277,6 +277,22 @@ def observe_links(
             observe(db, site.robots, linked, "link:" + path, None, observed_at)
 
 
+def mark_rescheduled_results(db: sqlite3.Connection) -> None:
+    # JRA canceled Kyoto on 2025-02-08 and ran all 12 races on 2025-02-10.
+    # https://jra.jp/news/202502/020802.html
+    for number in range(1, 13):
+        prefix = f"/race_kekka/820250103{number:02d}"
+        original = prefix + "20250208"
+        replacement = prefix + "20250210"
+        db.execute(
+            """UPDATE pages SET decision='excluded', reason=?
+               WHERE path=? AND category='result' AND decision='ready'
+               AND EXISTS (SELECT 1 FROM versions WHERE path=?)
+               AND NOT EXISTS (SELECT 1 FROM versions WHERE path=pages.path)""",
+            (f"Rescheduled to {replacement}", original, replacement),
+        )
+
+
 def check_hold(db: sqlite3.Connection) -> None:
     hold = db.execute("SELECT status, retry_at FROM site_hold WHERE id=1").fetchone()
     if hold is None:
@@ -446,6 +462,7 @@ def build_catalog(
                             listed += 1
                 for tag, archive in race_backups.items():
                     import_race_backup(db, site, tag, archive, now)
+                mark_rescheduled_results(db)
         except Blocked as error:
             blocked = error
             with db:
