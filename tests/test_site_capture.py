@@ -278,14 +278,14 @@ class SiteCaptureTests(unittest.TestCase):
 
     def test_challenge_and_gone_response_are_kept_out_of_html_archive(self):
         self.responses[ARTICLE] = response(b"gone", 410)
-        self.responses[JOCKEY] = response(
-            b"<html><title>Verify you are human</title><body>Challenge</body></html>"
-        )
+        self.responses[JOCKEY] = response(b"<html><title>Verify you are human</title>")
         output = self.root / "challenge"
         summary, status = capture_batch(ORIGIN, self.seed / "catalog.zip", output, TAG, "all", 10)
         self.assertEqual(status, "failed")
         self.assertEqual(summary["last_batch_saved"], 0)
         self.assertEqual(summary["by_state"], {"pending": 2, "missing": 1, "review": 1})
+        self.assertEqual(self.calls, ["/robots.txt", ARTICLE, JOCKEY])
+        self.assertEqual(summary["last_batch"]["validation_pending"], {})
         with ZipFile(output / "pages.zip") as bundle:
             self.assertEqual(bundle.namelist(), ["batch.json"])
             batch = json.loads(bundle.read("batch.json"))
@@ -294,11 +294,148 @@ class SiteCaptureTests(unittest.TestCase):
                 batch["failure"],
                 {
                     "stage": "validate_html",
-                    "error_type": "ValueError",
+                    "error_type": "PageValidationError",
                     "http_status": 200,
                     "content_type": "text/html",
+                    "reason": "access_page",
                 },
             )
+
+    def test_isolated_validation_failure_defers_only_that_page_and_retry_recovers(self):
+        races = [f"/race_result/120240102{number:02d}20240113" for number in range(1, 4)]
+        rejected, following, later = races
+        race_html = (
+            "<html><title>出走馬</title><body><h2>出走馬</h2>"
+            "<table><tr><th>馬名</th><th>オッズ</th></tr>"
+            "<tr><td>試験馬</td><td>3.1</td></tr></table></body></html>"
+        ).encode()
+        with closing(sqlite3.connect(self.seed / "catalog.sqlite3")) as db, db:
+            db.execute("DROP TABLE validation_pending")
+            db.executemany(
+                "INSERT INTO pages VALUES (?, 'race', 'ready', '', '2024-01-13')",
+                [(race,) for race in races],
+            )
+        (self.seed / "catalog.zip").unlink()
+        package_catalog(self.seed, {})
+        self.responses.update(dict.fromkeys(races, response(race_html)))
+        self.responses[rejected] = response(b"<html><title>Race</title><body>private</body></html>")
+
+        first = self.root / "isolated"
+        summary, status = capture_batch(
+            ORIGIN, self.seed / "catalog.zip", first, TAG, "all", 2, race_year=2024
+        )
+        self.assertEqual(status, "success")
+        self.assertEqual(self.calls, ["/robots.txt", rejected, following])
+        self.assertTrue(summary["last_batch"]["has_more"])
+        self.assertEqual(
+            summary["last_batch"]["progress"],
+            {"saved": 1, "pending": 1, "validation_pending": 1, "missing": 0},
+        )
+        with ZipFile(first / "pages.zip") as archive:
+            self.assertNotIn(archive_name(rejected), archive.namelist())
+            manifest = json.loads(archive.read("batch.json"))
+            self.assertEqual(
+                manifest["validation_pending"][rejected]["reason"], "race_table_invalid"
+            )
+            self.assertNotIn("private", json.dumps(manifest))
+
+        self.calls.clear()
+        resumed = self.root / "normal-resume"
+        summary, status = capture_batch(
+            ORIGIN, first / "catalog.zip", resumed, "site-batch-2-1", "all", 10, race_year=2024
+        )
+        self.assertEqual(status, "success")
+        self.assertEqual(self.calls, ["/robots.txt", later])
+        self.assertFalse(summary["last_batch"]["has_more"])
+        self.assertEqual(summary["last_batch"]["progress"]["validation_pending"], 1)
+        with closing(sqlite3.connect(resumed / "catalog.sqlite3")) as db:
+            self.assertEqual(
+                db.execute("SELECT path, reason, archive_tag FROM validation_pending").fetchall(),
+                [(rejected, "race_table_invalid", TAG)],
+            )
+            self.assertEqual(
+                db.execute("SELECT value FROM meta WHERE key='html_validation_streak'").fetchone(),
+                ("0",),
+            )
+
+        self.calls.clear()
+        self.responses[rejected] = response(race_html)
+        summary, status = capture_batch(
+            ORIGIN,
+            resumed / "catalog.zip",
+            self.root / "validation-retry",
+            "site-batch-3-1",
+            "all",
+            10,
+            retry_validation=True,
+            race_year=2024,
+        )
+        self.assertEqual(status, "success")
+        self.assertEqual(self.calls, ["/robots.txt", rejected])
+        self.assertEqual(summary["last_batch"]["mode"], "retry_validation")
+        self.assertFalse(summary["last_batch"]["has_more"])
+        self.assertEqual(
+            summary["last_batch"]["progress"],
+            {"saved": 3, "pending": 0, "validation_pending": 0, "missing": 0},
+        )
+        self.assertTrue(all(call.args == (5,) for call in self.sleep.call_args_list))
+
+    def test_three_consecutive_validation_failures_stop_across_checkpoints(self):
+        with closing(sqlite3.connect(self.seed / "catalog.sqlite3")) as db, db:
+            db.execute("INSERT INTO pages VALUES (?, 'chart', 'ready', '', NULL)", (CHART,))
+        (self.seed / "catalog.zip").unlink()
+        package_catalog(self.seed, {})
+        self.responses.update(dict.fromkeys((ARTICLE, JOCKEY, CHART), response(b"invalid HTML")))
+
+        first = self.root / "two-deferred"
+        summary, status = capture_batch(ORIGIN, self.seed / "catalog.zip", first, TAG, "all", 2)
+        self.assertEqual(status, "success")
+        self.assertEqual(summary["last_batch"]["progress"]["validation_pending"], 2)
+        self.assertEqual(self.calls, ["/robots.txt", ARTICLE, JOCKEY])
+
+        self.calls.clear()
+        summary, status = capture_batch(
+            ORIGIN, first / "catalog.zip", self.root / "threshold", "site-batch-2-1", "all", 10
+        )
+        self.assertEqual(status, "failed")
+        self.assertEqual(self.calls, ["/robots.txt", CHART])
+        self.assertEqual(summary["last_batch"]["failure"]["consecutive_validation_failures"], 3)
+        self.assertEqual(summary["last_batch"]["failure"]["reason"], "incomplete_document")
+        self.assertEqual(
+            summary["last_batch"]["progress"],
+            {"saved": 0, "pending": 1, "validation_pending": 3, "missing": 0},
+        )
+
+    def test_invalid_refresh_preserves_last_verified_html(self):
+        first = self.root / "original"
+        capture_batch(ORIGIN, self.seed / "catalog.zip", first, TAG, "horse", 1)
+        self.responses[HORSE] = response(b"<html><title>Horse</title><body>Invalid</body></html>")
+        refreshed = self.root / "invalid-refresh"
+        summary, status = capture_batch(
+            ORIGIN, first / "catalog.zip", refreshed, "site-batch-2-1", "horse", 1, refresh_hours=0
+        )
+        self.assertEqual(status, "success")
+        self.assertEqual(summary["by_state"]["validation_pending"], 1)
+        self.assertEqual(
+            locate_version(refreshed / "catalog.zip", HORSE).digest, sha256(HORSE_HTML)
+        )
+
+        self.calls.clear()
+        self.responses[HORSE] = response(HORSE_HTML)
+        summary, status = capture_batch(
+            ORIGIN,
+            refreshed / "catalog.zip",
+            self.root / "recovered-refresh",
+            "site-batch-3-1",
+            "horse",
+            1,
+            retry_validation=True,
+        )
+        self.assertEqual(status, "success")
+        self.assertEqual(self.calls, ["/robots.txt", HORSE])
+        self.assertEqual(summary["last_batch"]["unchanged"], 1)
+        self.assertEqual(summary["last_batch_saved"], 0)
+        self.assertEqual(summary["by_state"]["saved"], 1)
 
     def test_request_diagnostics_keep_status_and_omit_exception_text(self):
         cases = (

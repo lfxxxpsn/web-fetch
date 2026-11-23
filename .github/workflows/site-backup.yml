@@ -17,10 +17,10 @@ on:
         type: number
         default: 20
       mode:
-        description: "Backfill new targets or recheck previously observed pages"
+        description: "Backfill, refresh, or retry pages awaiting validation"
         type: choice
         default: "backfill"
-        options: ["backfill", "refresh"]
+        options: ["backfill", "refresh", "retry_validation"]
       min_age_hours:
         description: "Refresh mode only: minimum hours since the last check"
         type: number
@@ -101,6 +101,7 @@ jobs:
           case "$MODE" in
             backfill) ;;
             refresh) args+=(--refresh-hours "$MIN_AGE") ;;
+            retry_validation) args+=(--retry-validation) ;;
             *) exit 2 ;;
           esac
           if [[ -n "$RACE_YEAR" ]]; then
@@ -121,6 +122,13 @@ jobs:
           done
           has_more=$(python -c 'import json; print(str(json.load(open("backup/inventory.json"))["last_batch"].get("has_more", False)).lower())')
           printf 'result=%s\nhas_more=%s\n' "$code" "$has_more" >> "$GITHUB_OUTPUT"
+          jq -r '.last_batch | [
+            "### Backup progress",
+            "",
+            "**Saved** \(.progress.saved) · **Pending** \(.progress.pending) · **Needs review** \(.progress.validation_pending) · **Unavailable** \(.progress.missing)",
+            "",
+            "Pages deferred during this batch \(.validation_pending | length)"
+          ][]' backup/inventory.json >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v7
         id: upload
         with:

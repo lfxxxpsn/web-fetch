@@ -52,6 +52,15 @@ class SiteAuditTests(unittest.TestCase):
         self.assertEqual(audit.issues, [])
         self.assertEqual(audit.coverage["by_state"], {"saved": 3, "pending": 1})
 
+    def test_audits_legacy_catalog_without_validation_pending_table(self):
+        with closing(sqlite3.connect(self.root / "catalog.sqlite3")) as db, db:
+            db.execute("DROP TABLE validation_pending")
+        self.catalog.unlink()
+        package_catalog(self.root, {})
+        audit = audit_catalog(self.catalog, self.releases)
+        self.assertEqual(audit.verified_versions, 3)
+        self.assertEqual(audit.coverage["by_state"], {"saved": 3, "pending": 1})
+
     def test_reports_missing_archive_and_bad_member_even_if_zip_hash_matches(self):
         (self.releases / "site-batch-2-1/pages.zip").unlink()
         path, tag, name, html = self.records[0]

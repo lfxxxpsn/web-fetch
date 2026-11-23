@@ -116,6 +116,12 @@ CREATE TABLE IF NOT EXISTS missing (
     reason TEXT NOT NULL,
     archive_tag TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS validation_pending (
+    path TEXT PRIMARY KEY REFERENCES pages(path),
+    reason TEXT NOT NULL,
+    checked_at TEXT NOT NULL,
+    archive_tag TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS site_hold (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     status INTEGER NOT NULL CHECK (status IN (403, 429)),
@@ -381,21 +387,40 @@ def write_checksum(archive: Path) -> None:
     archive.with_suffix(".zip.sha256").write_text(f"{digest}  {archive.name}\n", encoding="ascii")
 
 
+def page_state_counts(
+    db: sqlite3.Connection, page_filter: str = "1", parameters: tuple[str, ...] = ()
+) -> sqlite3.Cursor:
+    has_validation_table = db.execute(
+        "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='validation_pending'"
+    ).fetchone()
+    validation_state = (
+        """WHEN p.decision='ready' AND EXISTS (
+               SELECT 1 FROM validation_pending v WHERE v.path=p.path
+           ) THEN 'validation_pending'"""
+        if has_validation_table
+        else ""
+    )
+    return db.execute(
+        f"""SELECT p.category,
+              CASE
+                {validation_state}
+                WHEN EXISTS (SELECT 1 FROM missing WHERE missing.path=p.path)
+                 AND EXISTS (SELECT 1 FROM versions WHERE versions.path=p.path)
+                  THEN 'saved_but_unavailable'
+                WHEN EXISTS (SELECT 1 FROM versions WHERE versions.path=p.path) THEN 'saved'
+                WHEN p.decision != 'ready' THEN p.decision
+                WHEN EXISTS (SELECT 1 FROM missing WHERE missing.path=p.path) THEN 'missing'
+                ELSE 'pending'
+              END AS state,
+              COUNT(*)
+            FROM pages p WHERE {page_filter}
+            GROUP BY p.category, state ORDER BY p.category, state""",
+        parameters,
+    )
+
+
 def summarize(db: sqlite3.Connection) -> dict[str, object]:
-    grouped = db.execute("""
-        SELECT category,
-          CASE
-            WHEN EXISTS (SELECT 1 FROM missing WHERE missing.path = pages.path)
-             AND EXISTS (SELECT 1 FROM versions WHERE versions.path = pages.path)
-              THEN 'saved_but_unavailable'
-            WHEN EXISTS (SELECT 1 FROM versions WHERE versions.path = pages.path) THEN 'saved'
-            WHEN decision != 'ready' THEN decision
-            WHEN EXISTS (SELECT 1 FROM missing WHERE missing.path = pages.path) THEN 'missing'
-            ELSE 'pending'
-          END AS state,
-          COUNT(*)
-        FROM pages GROUP BY category, state ORDER BY category, state
-    """)
+    grouped = page_state_counts(db)
     categories: dict[str, dict[str, int]] = {}
     totals: dict[str, int] = {}
     for category, state, count in grouped:

@@ -35,6 +35,7 @@ from site_catalog import (
     mark_rescheduled_results,
     observe_links,
     package_catalog,
+    page_state_counts,
     record_hold,
     restore_catalog,
     summarize,
@@ -44,17 +45,24 @@ from site_catalog import (
 
 BATCH_TAG = re.compile(r"site-batch-[0-9]+-[0-9]+")
 MAX_BATCH_PAGES = 100
+MAX_CONSECUTIVE_VALIDATION_FAILURES = 3
 PAGE_CATEGORIES = sorted({"all", "entry", *CATEGORIES.values()})
-ERROR_HEADING = re.compile(
-    r"access denied|forbidden|just a moment|attention required|"
-    r"verify you are human|service unavailable|page not found",
+ACCESS_HEADING = re.compile(
+    r"access denied|forbidden|just a moment|attention required|verify you are human",
     re.IGNORECASE,
 )
+ERROR_HEADING = re.compile(r"service unavailable|page not found", re.IGNORECASE)
 MEDIA_TYPE = re.compile(r"[a-z0-9][a-z0-9.+_-]{0,69}/[a-z0-9][a-z0-9.+_-]{0,69}")
 REQUIRED_MARKERS = {
     "horse": ("競走馬", "出走履歴", "の情報"),
     "jockey": ("騎手の成績", "出走予定・履歴", "騎手成績"),
 }
+
+
+class PageValidationError(ValueError):
+    def __init__(self, reason: str, message: str) -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 class Document(HTMLParser):
@@ -83,26 +91,59 @@ def validated_html(response: Response, category: str) -> str:
         "text/html",
         "application/xhtml+xml",
     }:
-        raise ValueError("Expected a successful HTML response.")
-    html = response.body.decode(response.headers.get_content_charset() or "utf-8")
+        raise PageValidationError("unexpected_media_type", "Expected a successful HTML response.")
+    try:
+        html = response.body.decode(response.headers.get_content_charset() or "utf-8")
+    except (UnicodeError, LookupError) as error:
+        raise PageValidationError(
+            "invalid_encoding", "Could not decode the HTML response."
+        ) from error
     document = Document()
     document.feed(html)
     headings = " ".join(document.headings).strip()
+    if ACCESS_HEADING.search(headings):
+        raise PageValidationError(
+            "access_page", "The page title or heading indicates an access stop."
+        )
     if not {"html", "body", "title"} <= document.tags or not headings:
-        raise ValueError("The response does not contain a full HTML document.")
+        raise PageValidationError("incomplete_document", "Expected a full HTML document.")
     if ERROR_HEADING.search(headings):
-        raise ValueError("The page title or main heading indicates an access or server error.")
+        raise PageValidationError("error_page", "The page title or heading indicates a site error.")
     if category == "race":
-        extract_tables(response)
+        try:
+            extract_tables(response)
+        except ValueError as error:
+            raise PageValidationError(
+                "race_table_invalid", "Expected a race entry table."
+            ) from error
     elif category == "result":
-        official_result(response)
+        try:
+            official_result(response)
+        except ValueError as error:
+            raise PageValidationError(
+                "result_table_invalid", "Expected an official result table."
+            ) from error
     elif category in REQUIRED_MARKERS:
         parser = TablesParser()
         parser.feed(html)
         visible = re.sub(r"\s+", "", "".join(parser.visible))
         if not any(marker in visible for marker in REQUIRED_MARKERS[category]):
-            raise ValueError("Expected page markers were absent.")
+            raise PageValidationError("markers_missing", "Expected page markers were absent.")
     return html
+
+
+def eligible_pages(
+    category: str, race_dates: tuple[str, str] | None, skip_race_day: str | None
+) -> tuple[str, tuple[str, ...]]:
+    page_filter = "p.decision='ready' AND (?='all' OR p.category=?)"
+    parameters: tuple[str, ...] = (category, category)
+    if race_dates:
+        page_filter += " AND p.race_day >= ? AND p.race_day < ?"
+        parameters += race_dates
+    if skip_race_day:
+        page_filter += " AND p.race_day <> ?"
+        parameters += (skip_race_day,)
+    return page_filter, parameters
 
 
 def next_pages(
@@ -113,12 +154,16 @@ def next_pages(
     *,
     race_dates: tuple[str, str] | None = None,
     skip_race_day: str | None = None,
+    retry_validation: bool = False,
 ) -> list[tuple[str, str]]:
-    race_filter = "AND p.race_day >= ? AND p.race_day < ?" if race_dates else ""
-    filters = (category, category, *(race_dates or ()))
-    if skip_race_day:
-        race_filter += " AND p.race_day <> ?"
-        filters += (skip_race_day,)
+    page_filter, parameters = eligible_pages(category, race_dates, skip_race_day)
+    if retry_validation:
+        return db.execute(
+            f"""SELECT p.path, p.category FROM validation_pending v
+                JOIN pages p ON p.path=v.path WHERE {page_filter}
+                ORDER BY v.checked_at, p.path LIMIT ?""",
+            (*parameters, limit),
+        ).fetchall()
     if refresh_before is not None:
         return db.execute(
             f"""WITH candidates AS (
@@ -126,7 +171,8 @@ def next_pages(
                        (SELECT MAX(indexed_at) FROM versions WHERE versions.path=p.path),
                        '') AS checked_at
                    FROM pages p LEFT JOIN page_checks c ON c.path=p.path
-                   WHERE p.decision='ready' AND (?='all' OR p.category=?) {race_filter}
+                   WHERE {page_filter}
+                   AND NOT EXISTS (SELECT 1 FROM validation_pending v WHERE v.path=p.path)
                    AND (EXISTS (SELECT 1 FROM versions WHERE versions.path=p.path)
                         OR EXISTS (SELECT 1 FROM missing WHERE missing.path=p.path))
                )
@@ -138,17 +184,18 @@ def next_pages(
                    AND julianday(d.lastmod) <= julianday(d.seen_at)
                ) DESC, checked_at, path
                LIMIT ?""",
-            (*filters, refresh_before, limit),
+            (*parameters, refresh_before, limit),
         ).fetchall()
     return db.execute(
         f"""SELECT p.path, p.category FROM pages p
-           WHERE p.decision='ready' AND (?='all' OR p.category=?) {race_filter}
+           WHERE {page_filter}
+           AND NOT EXISTS (SELECT 1 FROM validation_pending v WHERE v.path=p.path)
            AND NOT EXISTS (SELECT 1 FROM versions WHERE versions.path=p.path)
            AND NOT EXISTS (SELECT 1 FROM missing WHERE missing.path=p.path)
            ORDER BY CASE category WHEN 'entry' THEN 0 WHEN 'result' THEN 1
                     WHEN 'race' THEN 2 ELSE 3 END, path
            LIMIT ?""",
-        (*filters, limit),
+        (*parameters, limit),
     ).fetchall()
 
 
@@ -200,12 +247,15 @@ def failure_details(
         if isinstance(error, URLError) and isinstance(error.reason, Exception)
         else error
     )
-    return {
+    details: dict[str, str | int | None] = {
         "stage": stage,
         "error_type": type(cause).__name__,
         "http_status": status,
         "content_type": media_type if media_type and MEDIA_TYPE.fullmatch(media_type) else None,
     }
+    if isinstance(error, PageValidationError):
+        details["reason"] = error.reason
+    return details
 
 
 def capture_batch(
@@ -217,6 +267,7 @@ def capture_batch(
     limit: int,
     *,
     refresh_hours: int | None = None,
+    retry_validation: bool = False,
     race_year: int | None = None,
     skip_race_day: date | None = None,
     race_backup: tuple[str, Path] | None = None,
@@ -229,6 +280,8 @@ def capture_batch(
         raise ValueError("Invalid minimum age for refreshing pages.")
     if race_year is not None and not 1 <= race_year < 9999:
         raise ValueError("Invalid race year.")
+    if retry_validation and refresh_hours is not None:
+        raise ValueError("Validation retry must run separately from refresh.")
     if skip_race_day is not None and skip_race_day.year != race_year:
         raise ValueError("The excluded race date must be in the selected year.")
     if race_backup is not None:
@@ -251,9 +304,22 @@ def capture_batch(
             min(date(race_year + 1, 1, 1), today_in_japan).isoformat(),
         )
     excluded_day = skip_race_day.isoformat() if skip_race_day else None
+
+    def select_pages(db: sqlite3.Connection, maximum: int) -> list[tuple[str, str]]:
+        return next_pages(
+            db,
+            category,
+            maximum,
+            cutoff,
+            race_dates=race_dates,
+            skip_race_day=excluded_day,
+            retry_validation=retry_validation,
+        )
+
     site = Site(origin, Checkpoint("", sha256(origin.encode())))
     saved: dict[str, dict[str, str | int]] = {}
     absent: dict[str, str] = {}
+    deferred: dict[str, dict[str, str | int | None]] = {}
     unchanged = 0
     reused = 0
     status = "success"
@@ -269,6 +335,10 @@ def capture_batch(
         db.execute("PRAGMA foreign_keys=ON")
         db.executescript(SCHEMA)
         check_hold(db)
+        streak_row = db.execute(
+            "SELECT value FROM meta WHERE key='html_validation_streak'"
+        ).fetchone()
+        validation_streak = int(streak_row[0]) if streak_row else 0
         try:
             if race_backup is not None:
                 site.read_robots()
@@ -276,9 +346,7 @@ def capture_batch(
                 import_race_backup(db, site, *race_backup, now)
             stage = "select_pages"
             mark_rescheduled_results(db)
-            pending = next_pages(
-                db, category, limit, cutoff, race_dates=race_dates, skip_race_day=excluded_day
-            )
+            pending = select_pages(db, limit)
             if pending and race_backup is None:
                 stage = "read_robots"
                 site.read_robots()
@@ -304,10 +372,35 @@ def capture_batch(
                     db.execute(
                         "INSERT OR REPLACE INTO missing VALUES (?, ?, ?)", (path, str(error), tag)
                     )
+                    db.execute("DELETE FROM validation_pending WHERE path=?", (path,))
                     record_check(db, path, now, tag, prior, ("missing", None))
+                    validation_streak = 0
                     continue
                 stage = "validate_html"
-                html = validated_html(response, current[0])
+                try:
+                    html = validated_html(response, current[0])
+                except PageValidationError as error:
+                    if error.reason == "access_page":
+                        raise
+                    stage = "defer_validation"
+                    db.execute(
+                        """INSERT INTO validation_pending VALUES (?, ?, ?, ?)
+                           ON CONFLICT(path) DO UPDATE SET reason=excluded.reason,
+                             checked_at=excluded.checked_at, archive_tag=excluded.archive_tag""",
+                        (path, error.reason, now, tag),
+                    )
+                    deferred[path] = failure_details("validate_html", error, response)
+                    validation_streak += 1
+                    if validation_streak >= MAX_CONSECUTIVE_VALIDATION_FAILURES:
+                        status = "failed"
+                        failure = {
+                            **deferred[path],
+                            "consecutive_validation_failures": validation_streak,
+                        }
+                        validation_streak = 0
+                        break
+                    continue
+                validation_streak = 0
                 stage = "save_html"
                 digest = sha256(response.body)
                 member = archive_name(path)
@@ -331,6 +424,7 @@ def capture_batch(
                         "content_type": response.headers.get("Content-Type", ""),
                     }
                 db.execute("DELETE FROM missing WHERE path=?", (path,))
+                db.execute("DELETE FROM validation_pending WHERE path=?", (path,))
                 record_check(db, path, now, tag, prior, ("saved", digest))
                 stage = "discover_links"
                 observe_links(db, site, path, html, now)
@@ -341,18 +435,35 @@ def capture_batch(
         except (OSError, ValueError, LookupError) as error:
             status = "failed"
             failure = failure_details(stage, error, response)
+        db.execute(
+            "INSERT OR REPLACE INTO meta VALUES ('html_validation_streak', ?)",
+            (str(validation_streak),),
+        )
         mark_rescheduled_results(db)
+        if retry_validation:
+            mode = "retry_validation"
+        else:
+            mode = "backfill" if cutoff is None else "refresh"
+        progress = dict.fromkeys(("saved", "pending", "validation_pending", "missing"), 0)
+        for _, state, count in page_state_counts(
+            db, *eligible_pages(category, race_dates, excluded_day)
+        ):
+            if state == "saved_but_unavailable":
+                state = "saved"
+            progress[state] += count
         batch: dict[str, object] = {
             "format_version": 1,
             "tag": tag,
             "captured_at_utc": now,
             "category": category,
-            "mode": "backfill" if cutoff is None else "refresh",
+            "mode": mode,
             "state": status,
             "last_path": last_path,
             "site_requests": site.checkpoint.requests_this_run,
             "pages": saved,
             "missing": absent,
+            "validation_pending": deferred,
+            "progress": progress,
             "unchanged": unchanged,
             "reused_version": reused,
         }
@@ -363,9 +474,8 @@ def capture_batch(
             batch["has_more"] = (
                 status == "success"
                 and cutoff is None
-                and bool(
-                    next_pages(db, category, 1, race_dates=race_dates, skip_race_day=excluded_day)
-                )
+                and not retry_validation
+                and bool(select_pages(db, 1))
             )
         if excluded_day is not None:
             batch["skipped_race_day"] = excluded_day
@@ -394,11 +504,16 @@ def main() -> int:
     parser.add_argument(
         "--race-year", type=int, help="Select dated pages before the current Japan date"
     )
+    parser.add_argument(
+        "--retry-validation", action="store_true", help="Retry only pages pending validation review"
+    )
     parser.add_argument("--skip-race-day", type=date.fromisoformat, metavar="YYYY-MM-DD")
     parser.add_argument("--race-backup", nargs=2, metavar=("TAG", "FILE"))
     args = parser.parse_args()
     if args.race_year is not None and not 1 <= args.race_year < 9999:
         parser.error("--race-year must be between 1 and 9998.")
+    if args.retry_validation and args.refresh_hours is not None:
+        parser.error("--retry-validation cannot be used with --refresh-hours.")
     if args.skip_race_day is not None and args.skip_race_day.year != args.race_year:
         parser.error("--skip-race-day must be in the selected --race-year.")
     race_backup = (args.race_backup[0], Path(args.race_backup[1])) if args.race_backup else None
@@ -412,6 +527,7 @@ def main() -> int:
             args.category,
             args.limit,
             refresh_hours=args.refresh_hours,
+            retry_validation=args.retry_validation,
             race_year=args.race_year,
             skip_race_day=args.skip_race_day,
             race_backup=race_backup,
