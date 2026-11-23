@@ -158,6 +158,53 @@ class ExtractionTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "race table"):
                         probe.extract_tables(response(candidate))
 
+    def test_accepts_empty_canceled_debut_race_with_pedigree_headers(self):
+        title = "3歳新馬 京都競馬 第4レース 2025年2月8日 予想"
+        body = f"""<html><head><title>{title}</title></head>
+<body><p>競争中止</p><h2>出走馬</h2><table><thead>
+<tr><th>馬名</th><th>総合<br>値</th><th>騎手名</th><th>父</th><th>母</th>
+<th>父の子<br>新馬戦成績</th><th>母の子<br>新馬戦成績</th></tr>
+</thead><tbody></tbody></table></body></html>"""
+        tables = probe.extract_tables(response(body))
+        self.assertEqual(len(tables[0].rows), 1)
+        self.assertEqual(tables[0].rows[0][0].text, "馬名")
+
+        invalid_pages = (
+            body.replace("<p>競争中止</p>", ""),
+            body.replace(title, "出走馬 予想"),
+            body.replace("<th>母の子<br>新馬戦成績</th>", "<th>人気</th>"),
+            body.replace("<h2>出走馬</h2>", ""),
+        )
+        for candidate in invalid_pages:
+            with (
+                self.subTest(candidate=candidate),
+                self.assertRaisesRegex(ValueError, "race table"),
+            ):
+                probe.extract_tables(response(candidate))
+
+    def test_accepts_empty_canceled_named_race_only_with_matching_visible_heading(self):
+        body = """<html><head><title>橿原ステークス 2025 予想 | 競馬予想</title></head>
+<body><span class="date_change">2025/02/08</span>
+<section class="title"><div class="course_and_race_no">京都<br>9R</div>
+<h3 class="race_name">橿原ステークス</h3><h4>4上3勝クラス 1200m ダート 14:25発走</h4>
+</section><p>競争中止</p><h2>出走馬</h2><table>
+<tr><th>馬名</th><th>総合値</th><th>SP値</th><th>AG値</th><th>SA値</th></tr>
+</table></body></html>"""
+        tables = probe.extract_tables(response(body))
+        self.assertEqual(len(tables[0].rows), 1)
+
+        cases = (
+            ("different race name", body.replace(">橿原ステークス</h3>", ">別のレース</h3>")),
+            ("different year", body.replace("2025/02/08", "2024/02/08")),
+            ("invalid race number", body.replace("9R", "13R")),
+            ("non-race heading", body.replace("14:25発走", "更新時刻 14:25")),
+            ("no cancellation", body.replace("<p>競争中止</p>", "")),
+            ("no matching table", body.replace("<th>SA値</th>", "<th>人気</th>")),
+        )
+        for name, candidate in cases:
+            with self.subTest(case=name), self.assertRaisesRegex(ValueError, "race table"):
+                probe.extract_tables(response(candidate))
+
     def test_nested_table_does_not_lose_parent_cell_text(self):
         body = HTML.replace(
             "テストホース &amp; 馬",

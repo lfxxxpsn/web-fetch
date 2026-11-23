@@ -41,6 +41,7 @@ REQUEST_HEADERS = {
 }
 MIN_DELAY = 5
 MAX_BYTES = 8 * 1024 * 1024
+RACE_VENUES = r"札幌|函館|福島|新潟|東京|中山|中京|京都|阪神|小倉"
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -208,6 +209,23 @@ def fetch_once(url: str) -> Response:
         return Response(response.status, response.headers, body, wire_bytes=len(wire_body))
 
 
+def has_named_race_heading(title: str, fragments: list[str]) -> bool:
+    match = re.fullmatch(r"(.+?)\s+(\d{4})\s+予想(?:\s*\|.+)?", title.strip())
+    if not match:
+        return False
+    race_name, year = match.groups()
+    visible = [fragment.strip() for fragment in fragments if fragment.strip()]
+    return any(re.fullmatch(rf"{year}/\d{{2}}/\d{{2}}", text) for text in visible) and any(
+        re.fullmatch(RACE_VENUES, venue)
+        and re.fullmatch(r"(?:[1-9]|1[0-2])R", race_number)
+        and name == race_name
+        and re.search(r"\d{1,2}:\d{2}\s*発走$", details)
+        for venue, race_number, name, details in zip(
+            visible, visible[1:], visible[2:], visible[3:], strict=False
+        )
+    )
+
+
 def extract_tables(response: Response) -> list[Table]:
     if response.status != 200:
         raise ValueError(f"HTTP {response.status}; stopped without retry or redirect.")
@@ -224,7 +242,7 @@ def extract_tables(response: Response) -> list[Table]:
         canceled = any(fragment.strip() == "競争中止" for fragment in parser.visible)
         race_title = " ".join(parser.title)
         has_race_title = bool(
-            re.search(r"(?:札幌|函館|福島|新潟|東京|中山|中京|京都|阪神|小倉)競馬", race_title)
+            re.search(rf"(?:{RACE_VENUES})競馬", race_title)
             and re.search(r"第\s*\d+\s*レース", race_title)
             and re.search(r"\d{4}年\s*\d{1,2}月\s*\d{1,2}日", race_title)
         )
@@ -243,15 +261,18 @@ def extract_tables(response: Response) -> list[Table]:
                         for row in table.rows[1:]
                     ):
                         return parser.tables
-        if canceled and has_race_title:
-            required_empty_headers = {"馬名", "総合値", "SP値", "AG値", "SA値"}
+        if canceled and (has_race_title or has_named_race_heading(race_title, parser.visible)):
+            empty_lineup_headers = (
+                {"馬名", "総合値", "SP値", "AG値", "SA値"},
+                {"馬名", "総合値", "騎手名", "父", "母", "父の子新馬戦成績", "母の子新馬戦成績"},
+            )
             for table in parser.tables:
                 if len(table.rows) != 1:
                     continue
                 empty_headers = {
                     re.sub(r"\s+", "", cell.text) for cell in table.rows[0] if cell.tag == "th"
                 }
-                if required_empty_headers.issubset(empty_headers):
+                if any(required <= empty_headers for required in empty_lineup_headers):
                     return parser.tables
     raise ValueError("Expected race table is missing; this may be an error/challenge page.")
 
