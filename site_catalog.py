@@ -13,6 +13,7 @@ from datetime import UTC, date, datetime
 from email.message import Message
 from html.parser import HTMLParser
 from pathlib import Path, PurePosixPath
+from shutil import copyfileobj
 from tempfile import TemporaryDirectory
 from urllib.error import URLError
 from urllib.parse import unquote, urljoin, urlsplit
@@ -34,7 +35,7 @@ from fetch_page import USER_AGENT, load_target_url
 
 RACE_TAG = re.compile(r"pilot-[0-9]+-[0-9]+")
 RACE_ANALYSIS_LINK = re.compile(r"/race_(?:analytics|aredo)/[0-9]+\?race_id=[0-9]{9,32}")
-MAX_CATALOG_BYTES = 256 * 1024**2
+MAX_CATALOG_BYTES = 512 * 1024**2
 MAX_SITEMAPS = 12
 STATIC_SUFFIXES = {
     ".avif",
@@ -357,20 +358,35 @@ def import_race_backup(
             )
 
 
+class CatalogSizeLimitError(ValueError):
+    """The uncompressed SQLite catalog exceeds the read or write limit."""
+
+
+def check_catalog_size(size: int) -> None:
+    if size > MAX_CATALOG_BYTES:
+        raise CatalogSizeLimitError(
+            f"SQLite catalog size {size} bytes exceeds the {MAX_CATALOG_BYTES}-byte limit."
+        )
+
+
 def restore_catalog(destination: Path, archive: Path, origin: str | None) -> None:
     verify_checksum(archive)
-    with ZipFile(archive) as bundle:
-        if bundle.getinfo("catalog.sqlite3").file_size > MAX_CATALOG_BYTES:
-            raise ValueError("Previous catalog is too large.")
-        destination.write_bytes(bundle.read("catalog.sqlite3"))
-    with closing(sqlite3.connect(destination, autocommit=True)) as db:
-        if db.execute("PRAGMA quick_check").fetchone() != ("ok",):
-            raise ValueError("Previous catalog failed SQLite integrity checks.")
-        meta = dict(db.execute("SELECT key, value FROM meta"))
-        if meta.get("version") != "1" or (
-            origin is not None and meta.get("site_hash") != sha256(origin.encode())
-        ):
-            raise ValueError("Previous catalog belongs to a different site or format.")
+    with TemporaryDirectory(dir=destination.parent, prefix=".catalog-") as scratch:
+        staged = Path(scratch) / "catalog.sqlite3"
+        with ZipFile(archive) as bundle:
+            member = bundle.getinfo("catalog.sqlite3")
+            check_catalog_size(member.file_size)
+            with bundle.open(member) as source, staged.open("xb") as target:
+                copyfileobj(source, target, length=1024**2)
+        with closing(sqlite3.connect(staged, autocommit=True)) as db:
+            if db.execute("PRAGMA quick_check").fetchone() != ("ok",):
+                raise ValueError("Previous catalog failed SQLite integrity checks.")
+            meta = dict(db.execute("SELECT key, value FROM meta"))
+            if meta.get("version") != "1" or (
+                origin is not None and meta.get("site_hash") != sha256(origin.encode())
+            ):
+                raise ValueError("Previous catalog belongs to a different site or format.")
+        staged.replace(destination)
 
 
 def verify_checksum(archive: Path) -> None:
@@ -512,8 +528,7 @@ def build_catalog(
 
 
 def package_catalog(output: Path, summary: dict[str, object]) -> None:
-    if (output / "catalog.sqlite3").stat().st_size > MAX_CATALOG_BYTES:
-        raise ValueError("Catalog reached the supported size limit.")
+    check_catalog_size((output / "catalog.sqlite3").stat().st_size)
     (output / "inventory.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     archive = output / "catalog.zip"
     with ZipFile(archive, "x", compression=ZIP_DEFLATED, compresslevel=9) as bundle:
@@ -544,6 +559,8 @@ def main() -> int:
         if error.retry_at:
             print(f"Retry no earlier than {error.retry_at}.")
         return 2
+    except CatalogSizeLimitError as error:
+        parser.exit(1, f"{error}\n")
     except (
         ValueError,
         TypeError,

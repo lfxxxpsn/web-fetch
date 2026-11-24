@@ -91,7 +91,7 @@ Secret 只注入實際抓取的步驟；離線檢查不需要 Secret。未設定
 
 Actions 摘要依本次選擇的頁型和年度列出已保存、待補、待查與缺頁數。擷取中止時，日誌記錄失敗階段、錯誤類型，以及可取得的 HTTP 狀態、媒體類型和驗證原因。批次的 `batch.json` 與索引的 `inventory.json` 也記錄本批待查頁的路徑與原因。
 
-每個 `site-batch-<run_id>-<run_attempt>` 有兩個 ZIP 及各自的 SHA-256 校驗檔。更新後的 `catalog.zip` 記錄全部已備份頁面的 Release tag、檔名與雜湊；`pages.zip` 只裝本次新增的 HTML 與其 `batch.json`，舊頁留在原 Release。下一批或再次盤點時可沿用最新 tag。
+每個 `site-batch-<run_id>-<run_attempt>` 有兩個 ZIP 及各自的 SHA-256 校驗檔。更新後的 `catalog.zip` 記錄全部已備份頁面的 Release tag、檔名與雜湊；`pages.zip` 只裝本次新增的 HTML 與其 `batch.json`，舊頁留在原 Release。下一批或再次盤點時可沿用最新 tag。SQLite 索引上限為 512 MiB，還原時會分段解壓並檢查校驗值、資料庫完整性與站點識別。觸及上限時，Actions 會記錄檔案大小與上限。
 
 ### 一次啟動年度回補
 

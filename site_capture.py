@@ -28,6 +28,7 @@ from fetch_page import Response, TablesParser, extract_tables, load_target_url
 from site_catalog import (
     CATEGORIES,
     SCHEMA,
+    CatalogSizeLimitError,
     address,
     check_hold,
     classify,
@@ -532,6 +533,8 @@ def main() -> int:
             skip_race_day=args.skip_race_day,
             race_backup=race_backup,
         )
+    except CatalogSizeLimitError as error:
+        parser.exit(1, f"{error}\n")
     except (ValueError, TypeError, OSError, KeyError, BadZipFile, sqlite3.Error) as error:
         message = (
             str(error)

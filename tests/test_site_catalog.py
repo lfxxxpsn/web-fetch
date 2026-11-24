@@ -12,7 +12,13 @@ from zipfile import ZipFile
 
 from batch_capture import Blocked, archive_name, sha256
 from fetch_page import Response
-from site_catalog import build_catalog, verify_checksum
+from site_catalog import (
+    CatalogSizeLimitError,
+    build_catalog,
+    package_catalog,
+    restore_catalog,
+    verify_checksum,
+)
 
 ORIGIN = "https://example.invalid"
 RACES = [f"/race_result/120260102{i:02}20261114" for i in range(1, 4)]
@@ -160,6 +166,38 @@ class SiteCatalogTests(unittest.TestCase):
                 db.execute("SELECT decision FROM pages WHERE path='/uma_detail/1'").fetchone(),
                 ("excluded",),
             )
+
+    def test_catalog_size_limit_applies_to_streaming_restore_and_package(self):
+        source = self.root / "source-catalog"
+        build_catalog(ORIGIN, source, previous=None, race_backups={})
+        archive = source / "catalog.zip"
+        original = (source / "catalog.sqlite3").read_bytes()
+        destination = self.root / "restored.sqlite3"
+        with (
+            patch("site_catalog.MAX_CATALOG_BYTES", len(original)),
+            patch.object(ZipFile, "read", side_effect=AssertionError("Whole-member buffering")),
+        ):
+            restore_catalog(destination, archive, ORIGIN)
+        self.assertEqual(destination.read_bytes(), original)
+
+        limit = len(original) - 1
+        message = rf"{len(original)} bytes exceeds the {limit}-byte limit"
+        with patch("site_catalog.MAX_CATALOG_BYTES", limit):
+            with self.assertRaisesRegex(CatalogSizeLimitError, message):
+                restore_catalog(destination, archive, ORIGIN)
+            with self.assertRaisesRegex(CatalogSizeLimitError, message):
+                package_catalog(source, {})
+        self.assertEqual(destination.read_bytes(), original)
+        verify_checksum(archive)
+
+    def test_invalid_site_catalog_does_not_replace_existing_destination(self):
+        source = self.root / "wrong-origin"
+        build_catalog(ORIGIN, source, previous=None, race_backups={})
+        destination = self.root / "existing.sqlite3"
+        destination.write_bytes(b"existing")
+        with self.assertRaisesRegex(ValueError, "belongs to a different site"):
+            restore_catalog(destination, source / "catalog.zip", "https://different.invalid")
+        self.assertEqual(destination.read_bytes(), b"existing")
 
     def test_damaged_backup_never_creates_a_catalog_zip(self):
         archive = self.backup()
