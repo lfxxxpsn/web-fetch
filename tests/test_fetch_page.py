@@ -205,6 +205,33 @@ class ExtractionTests(unittest.TestCase):
             with self.subTest(case=name), self.assertRaisesRegex(ValueError, "race table"):
                 probe.extract_tables(response(candidate))
 
+    def test_race_without_runners_requires_matching_id_and_bet_data(self):
+        url = "https://example.invalid/race_result/0202402040920240218"
+        metadata = json.dumps(
+            {"@type": "BreadcrumbList", "itemListElement": [{"item": {"url": url}}]}
+        )
+        body = f"""<html><head><title>伊万里特別 2024 予想</title>
+<script type="application/ld+json">{metadata}</script></head>
+<body><span>2024/02/18</span><div>小倉<br>9R</div>
+<h3>伊万里特別</h3><h4>1000m ダート 14:05発走</h4>
+<h2>出走馬</h2><table><tr><th>仮<br>番</th></tr></table>
+<table><tr><th>馬名</th><th>総合<br>値</th><th>SP値</th><th>AG値</th><th>SA値</th></tr></table>
+<table><tr><th>種類</th><th>馬券</th><th>買い目</th></tr>
+<tr><th>ワイド</th><td>ﾌｫﾒ</td><td>5－4</td></tr></table></body></html>"""
+        self.assertEqual(len(probe.extract_tables(response(body), expected_url=url)), 3)
+
+        cases = (
+            ("different race", body.replace("0202402040920240218", "0202402041020240218")),
+            ("different origin", body.replace("example.invalid", "other.invalid")),
+            ("malformed breadcrumb", body.replace(metadata, "{")),
+            ("absent number table", body.replace("仮<br>番", "当日")),
+            ("absent betting data", body.replace("<td>5－4</td>", "<td>－</td>")),
+            ("zero race number", body.replace("<td>5－4</td>", "<td>0－4</td>")),
+        )
+        for name, rejected in cases:
+            with self.subTest(case=name), self.assertRaisesRegex(ValueError, "race table"):
+                probe.extract_tables(response(rejected), expected_url=url)
+
     def test_nested_table_does_not_lose_parent_cell_text(self):
         body = HTML.replace(
             "テストホース &amp; 馬",

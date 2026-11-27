@@ -87,7 +87,7 @@ class Document(HTMLParser):
             self.headings.append(data)
 
 
-def validated_html(response: Response, category: str) -> str:
+def validated_html(response: Response, category: str, *, expected_url: str | None = None) -> str:
     if response.status != 200 or response.headers.get_content_type() not in {
         "text/html",
         "application/xhtml+xml",
@@ -112,14 +112,14 @@ def validated_html(response: Response, category: str) -> str:
         raise PageValidationError("error_page", "The page title or heading indicates a site error.")
     if category == "race":
         try:
-            extract_tables(response)
+            extract_tables(response, expected_url=expected_url)
         except ValueError as error:
             raise PageValidationError(
                 "race_table_invalid", "Expected a race entry table."
             ) from error
     elif category == "result":
         try:
-            official_result(response)
+            official_result(response, expected_url=expected_url)
         except ValueError as error:
             raise PageValidationError(
                 "result_table_invalid", "Expected an official result table."
@@ -379,7 +379,7 @@ def capture_batch(
                     continue
                 stage = "validate_html"
                 try:
-                    html = validated_html(response, current[0])
+                    html = validated_html(response, current[0], expected_url=origin + path)
                 except PageValidationError as error:
                     if error.reason == "access_page":
                         raise

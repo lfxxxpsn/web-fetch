@@ -29,7 +29,9 @@ from fetch_page import (
     TablesParser,
     extract_tables,
     fetch_once,
+    has_empty_ratings_lineup,
     load_target_url,
+    matches_race_breadcrumb,
 )
 
 RACE_COUNT = 3
@@ -210,18 +212,29 @@ class ResultLink(HTMLParser):
             self.found |= same_site_path(self.origin, urljoin(self.base, href)) == self.expected
 
 
-def official_result(response: Response) -> None:
+def official_result(response: Response, *, expected_url: str | None = None) -> None:
     if response.headers.get_content_type() not in {"text/html", "application/xhtml+xml"}:
         raise ValueError("The result response is not HTML.")
     parser = TablesParser()
     parser.feed(response.body.decode(response.headers.get_content_charset() or "utf-8"))
     visible = re.sub(r"\s+", "", "".join(parser.visible))
-    if "着順" not in visible or not any(
-        len(table.rows) >= 2
-        and "馬名" in re.sub(r"\s+", "", "".join(cell.text for cell in table.rows[0]))
-        for table in parser.tables
-    ):
-        raise ValueError("The expected official result table is absent.")
+    if "着順" in visible:
+        if any(
+            len(table.rows) >= 2
+            and "馬名" in re.sub(r"\s+", "", "".join(cell.text for cell in table.rows[0]))
+            for table in parser.tables
+        ):
+            return
+        if (
+            expected_url is not None
+            and "結果・払い戻し" in "".join(parser.title)
+            and matches_race_breadcrumb(parser, expected_url)
+            and has_empty_ratings_lineup(parser.tables)
+            and any(fragment.strip() == "払い戻し" for fragment in parser.visible)
+            and re.search(r"払戻金は単勝[1-9][0-9]?番[1-9][0-9]*(?:,[0-9]{3})*円", visible)
+        ):
+            return
+    raise ValueError("The expected official result table is absent.")
 
 
 def restore(directory: Path, archive: Path, day: date, origin: str) -> Checkpoint:
@@ -301,7 +314,7 @@ def capture_race(
             state.missing[race] = str(error)
             state.missing[result] = "Race page unavailable"
             return
-        extract_tables(response)
+        extract_tables(response, expected_url=site.origin + race)
         save_page(directory, state, race, response)
         if page_budget == 1:
             return
@@ -323,7 +336,7 @@ def capture_race(
             raise
         state.missing[result] = str(error)
         return
-    official_result(response)
+    official_result(response, expected_url=site.origin + result)
     save_page(directory, state, result, response)
 
 

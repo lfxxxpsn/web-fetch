@@ -42,6 +42,10 @@ REQUEST_HEADERS = {
 MIN_DELAY = 5
 MAX_BYTES = 8 * 1024 * 1024
 RACE_VENUES = r"札幌|函館|福島|新潟|東京|中山|中京|京都|阪神|小倉"
+RATING_LINEUP_HEADERS = frozenset({"馬名", "総合値", "SP値", "AG値", "SA値"})
+DEBUT_LINEUP_HEADERS = frozenset(
+    {"馬名", "総合値", "騎手名", "父", "母", "父の子新馬戦成績", "母の子新馬戦成績"}
+)
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -90,6 +94,8 @@ class TablesParser(HTMLParser):
         self.parent_cells: list[Cell | None] = []
         self.cell: Cell | None = None
         self.ignored: str | None = None
+        self.json_ld: list[list[str]] = []
+        self.in_json_ld = False
         self.visible: list[str] = []
         self.in_title = False
         self.title: list[str] = []
@@ -97,6 +103,9 @@ class TablesParser(HTMLParser):
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if tag in {"script", "style"}:
             self.ignored = tag
+            self.in_json_ld = tag == "script" and dict(attrs).get("type") == "application/ld+json"
+            if self.in_json_ld:
+                self.json_ld.append([])
         if tag == "title":
             self.in_title = True
         if self.ignored:
@@ -124,6 +133,8 @@ class TablesParser(HTMLParser):
             self.cell.text += "\n"
 
     def handle_data(self, data: str) -> None:
+        if self.in_json_ld:
+            self.json_ld[-1].append(data)
         if not self.ignored:
             self.visible.append(data)
             if self.in_title:
@@ -134,6 +145,7 @@ class TablesParser(HTMLParser):
     def handle_endtag(self, tag: str) -> None:
         if tag == self.ignored:
             self.ignored = None
+            self.in_json_ld = False
         elif tag == "title":
             self.in_title = False
         elif self.ignored:
@@ -226,7 +238,57 @@ def has_named_race_heading(title: str, fragments: list[str]) -> bool:
     )
 
 
-def extract_tables(response: Response) -> list[Table]:
+def matches_race_breadcrumb(parser: TablesParser, expected_url: str) -> bool:
+    request = urlsplit(expected_url)
+    if not re.fullmatch(r"/race_(?:result|kekka)/[0-9]{9,32}", request.path):
+        return False
+    race_path = request.path.replace("/race_kekka/", "/race_result/", 1)
+    race_url = f"{request.scheme}://{request.netloc}{race_path}"
+    for block in parser.json_ld:
+        try:
+            data = json.loads("".join(block))
+        except ValueError, RecursionError:
+            continue
+        if not isinstance(data, dict) or data.get("@type") != "BreadcrumbList":
+            continue
+        items = data.get("itemListElement")
+        if isinstance(items, list) and items and isinstance(items[-1], dict):
+            item = items[-1].get("item")
+            if isinstance(item, dict) and item.get("url") == race_url:
+                return True
+    return False
+
+
+def has_header_only_table(tables: list[Table], *layouts: frozenset[str]) -> bool:
+    for table in tables:
+        if len(table.rows) == 1:
+            headers = {"".join(cell.text.split()) for cell in table.rows[0] if cell.tag == "th"}
+            if any(layout <= headers for layout in layouts):
+                return True
+    return False
+
+
+def has_empty_ratings_lineup(tables: list[Table]) -> bool:
+    return has_header_only_table(tables, frozenset({"仮番"})) and has_header_only_table(
+        tables, RATING_LINEUP_HEADERS
+    )
+
+
+def has_bet_predictions(tables: list[Table]) -> bool:
+    return any(
+        {"種類", "馬券", "買い目"} <= {"".join(cell.text.split()) for cell in table.rows[0]}
+        and any(
+            cell.tag == "td"
+            and re.fullmatch(r"[1-9][0-9]?(?:[,－-][1-9][0-9]?)+", cell.text.strip())
+            for row in table.rows[1:]
+            for cell in row
+        )
+        for table in tables
+        if len(table.rows) >= 2
+    )
+
+
+def extract_tables(response: Response, *, expected_url: str | None = None) -> list[Table]:
     if response.status != 200:
         raise ValueError(f"HTTP {response.status}; stopped without retry or redirect.")
     if len(response.body) > MAX_BYTES:
@@ -261,19 +323,21 @@ def extract_tables(response: Response) -> list[Table]:
                         for row in table.rows[1:]
                     ):
                         return parser.tables
-        if canceled and (has_race_title or has_named_race_heading(race_title, parser.visible)):
-            empty_lineup_headers = (
-                {"馬名", "総合値", "SP値", "AG値", "SA値"},
-                {"馬名", "総合値", "騎手名", "父", "母", "父の子新馬戦成績", "母の子新馬戦成績"},
-            )
-            for table in parser.tables:
-                if len(table.rows) != 1:
-                    continue
-                empty_headers = {
-                    re.sub(r"\s+", "", cell.text) for cell in table.rows[0] if cell.tag == "th"
-                }
-                if any(required <= empty_headers for required in empty_lineup_headers):
-                    return parser.tables
+        identified_race = has_race_title or has_named_race_heading(race_title, parser.visible)
+        if (
+            canceled
+            and identified_race
+            and has_header_only_table(parser.tables, RATING_LINEUP_HEADERS, DEBUT_LINEUP_HEADERS)
+        ):
+            return parser.tables
+        if (
+            expected_url is not None
+            and identified_race
+            and matches_race_breadcrumb(parser, expected_url)
+            and has_empty_ratings_lineup(parser.tables)
+            and has_bet_predictions(parser.tables)
+        ):
+            return parser.tables
     raise ValueError("Expected race table is missing; this may be an error/challenge page.")
 
 
@@ -311,7 +375,7 @@ def capture(url: str, output_root: Path, delay: int = MIN_DELAY) -> tuple[bool, 
                 "sha256": hashlib.sha256(response.body).hexdigest(),
             }
         )
-        table_count = len(extract_tables(response))
+        table_count = len(extract_tables(response, expected_url=url))
         (directory / "page.html").write_bytes(response.body)
         report["table_count"] = table_count
         report["success"] = success = True

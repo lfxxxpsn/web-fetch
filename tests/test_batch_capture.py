@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gzip
+import json
 import tempfile
 import unittest
 from datetime import UTC, date, datetime
@@ -9,7 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 from zipfile import ZipFile
 
-from batch_capture import archive_name, result_path, run_batch, sha256
+from batch_capture import archive_name, official_result, result_path, run_batch, sha256
 from fetch_page import Response
 
 ORIGIN = "https://example.invalid"
@@ -150,6 +151,35 @@ class BatchTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "blocked"):
             run_batch(ORIGIN, DAY, self.root / "blocked", 6, self.root / "first/batch.zip")
         self.assertEqual(self.events, [])
+
+    def test_result_without_rankings_requires_matching_id_and_payout(self):
+        race = ORIGIN + RACES[0]
+        url = ORIGIN + result_path(RACES[0])
+        metadata = json.dumps(
+            {"@type": "BreadcrumbList", "itemListElement": [{"item": {"url": race}}]}
+        )
+        payout = "払戻金は単勝10番11,080円。"
+        body = f"""<html><head><title>小倉 5R 結果・払い戻し</title>
+<script type="application/ld+json">{metadata}</script></head>
+<body><h2>着順・結果</h2><table><tr><th>仮番</th></tr></table>
+<table><tr><th>馬名</th><th>総合値</th><th>SP値</th><th>AG値</th><th>SA値</th></tr></table>
+<h2>払い戻し</h2><p>{payout}</p></body></html>"""
+        official_result(response(body), expected_url=url)
+
+        cases = (
+            ("different race", body.replace(RACES[0], RACES[1])),
+            ("missing result section", body.replace("着順・結果", "予想")),
+            ("missing payout amount", body.replace(payout, "払戻金は未定です。")),
+            ("zero payout", body.replace("11,080円", "0円")),
+            (
+                "payout in a script only",
+                body.replace(f"<p>{payout}</p>", f"<script>{payout}</script>"),
+            ),
+            ("missing runner name header", body.replace("馬名", "人気")),
+        )
+        for name, rejected in cases:
+            with self.subTest(case=name), self.assertRaisesRegex(ValueError, "result table"):
+                official_result(response(rejected), expected_url=url)
 
     def test_does_not_publish_challenge_as_result(self):
         self.responses[result_path(RACES[0])] = response("<title>Verify you are human</title>")
